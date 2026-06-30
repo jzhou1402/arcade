@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Linear ticket status page for the ghostty-linear tmux workflow.
+
+Lists assigned + active tickets, badges the ones with a live claude session,
+shows PR # + CI status. Up/Down paginate, Enter opens/attaches, y splits.
+"""
+import curses
+import json
+import os
+import re
+import subprocess
+import time
+
+TICKET_RE = re.compile(r"^[A-Za-z]+-\d+$")
+
+HOME = os.path.expanduser("~")
+CACHE = os.environ.get("GL_CACHE", os.path.join(HOME, ".cache/ghostty-linear"))
+BIN = os.path.dirname(os.path.abspath(__file__))
+TICKETS = os.path.join(CACHE, "tickets.json")
+SELECTED = os.path.join(CACHE, "selected")
+SESSION = os.environ.get("GL_SESSION", "hazel")
+TMUX = os.environ.get("TMUX_BIN") or "tmux"
+
+REFETCH_SECONDS = 180
+
+
+def load_tickets():
+    try:
+        with open(TICKETS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def live_tickets():
+    try:
+        out = subprocess.run(
+            [TMUX, "list-windows", "-t", SESSION, "-F",
+             "#{@ticket}|#{window_name}|#{@shown}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        ids = set()
+        for ln in out.stdout.splitlines():
+            opt, name, shown = (ln.split("|", 2) + ["", "", ""])[:3]
+            if opt.strip():
+                ids.add(opt.strip())
+            elif name.strip():
+                first = name.split(" ", 1)[0]
+                if TICKET_RE.match(first):
+                    ids.add(first)
+            # A ticket joined into the cockpit has no standalone window, but is
+            # very much live — surface it via the cockpit's @shown option.
+            if shown.strip():
+                ids.add(shown.strip())
+        return ids
+    except Exception:
+        return set()
+
+
+def write_selected(ticket_id):
+    try:
+        with open(SELECTED, "w") as f:
+            f.write(ticket_id + "\n")
+    except OSError:
+        pass
+
+
+def read_selected():
+    try:
+        with open(SELECTED) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def run_bg(args):
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def mark_cockpit():
+    """Tag this dashboard's window as the cockpit and record its pane id, so
+    gl-split/gl-open can join/break ticket panes alongside it."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return
+    for opt, val in (("@cockpit", "1"), ("@dashpane", pane)):
+        try:
+            subprocess.run([TMUX, "set-window-option", "-t", pane, opt, val],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=2)
+        except Exception:
+            pass
+
+
+def fetch_blocking(stdscr):
+    h, w = stdscr.getmaxyx()
+    msg = " Refreshing from Linear… "
+    try:
+        stdscr.addstr(h // 2, max(0, (w - len(msg)) // 2), msg, curses.A_REVERSE)
+        stdscr.refresh()
+    except curses.error:
+        pass
+    subprocess.run([os.path.join(BIN, "gl-fetch")], capture_output=True)
+
+
+def pr_cells(pr):
+    """Return (pr_text, pr_color, review_text, review_color)."""
+    if not pr or not pr.get("number"):
+        return ("", 0, "", 0)
+    num = pr.get("number")
+    checks = pr.get("checks", "none")
+    state = (pr.get("state") or "OPEN").upper()
+    draft = pr.get("draft")
+    mark = {"pass": "✓", "fail": "✗", "pending": "•", "none": "·"}.get(checks, "·")
+    label = "draft" if draft else state.lower()
+    color = {"pass": 3, "fail": 4, "pending": 5}.get(checks, 0)
+    if state == "MERGED":
+        color, label = 6, "merged"
+    elif state == "CLOSED":
+        color, label = 4, "closed"
+    review = pr.get("review", "")
+    rtext, rcolor = {
+        "approved": ("appr", 3),
+        "changes": ("chg!", 4),
+        "review": ("req", 5),
+    }.get(review, ("", 0))
+    if pr.get("mergeable") == "CONFLICTING":
+        rtext, rcolor = "conflx", 4
+    return (f"#{num} {mark} {label}", color, rtext, rcolor)
+
+
+def add_seg(stdscr, y, x, text, width, color, selected, maxw):
+    """Write a fixed-width segment, return the next x."""
+    cell = text[:width].ljust(width)
+    if x >= maxw:
+        return x
+    cell = cell[:maxw - x]
+    attr = curses.A_REVERSE if selected else (curses.color_pair(color) if color else 0)
+    try:
+        stdscr.addstr(y, x, cell, attr)
+    except curses.error:
+        pass
+    return x + len(cell)
+
+
+def draw(stdscr, tickets, idx, top, live, status_line):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    title = "  Linear — my active tickets"
+    count = f"{len(tickets)} tickets · {len(live)} live  "
+    stdscr.attron(curses.A_BOLD)
+    stdscr.addnstr(0, 0, title.ljust(max(0, w - len(count))) + count, w - 1)
+    stdscr.attroff(curses.A_BOLD)
+    stdscr.hline(1, 0, curses.ACS_HLINE, w)
+
+    body_top = 2
+    body_h = max(1, h - body_top - 1)
+    maxw = w - 1
+
+    for row, t in enumerate(tickets[top:top + body_h]):
+        i = top + row
+        y = body_top + row
+        sel = (i == idx)
+        tid = t.get("id", "?")
+        is_live = tid in live
+        state = t.get("state") or ""
+        prtext, prcolor, rtext, rcolor = pr_cells(t.get("pr"))
+        title_w = max(10, maxw - 3 - 11 - 13 - 16 - 7)
+        ttl = t.get("title") or ""
+
+        if sel:
+            stdscr.attron(curses.A_REVERSE)
+            try:
+                stdscr.addstr(y, 0, " ".ljust(maxw))
+            except curses.error:
+                pass
+            stdscr.attroff(curses.A_REVERSE)
+        x = 0
+        x = add_seg(stdscr, y, x, f" {'●' if is_live else ' '} ", 3, 3 if is_live else 0, sel, maxw)
+        x = add_seg(stdscr, y, x, tid, 11, 0, sel, maxw)
+        x = add_seg(stdscr, y, x, state, 13, 0, sel, maxw)
+        x = add_seg(stdscr, y, x, prtext, 16, prcolor, sel, maxw)
+        x = add_seg(stdscr, y, x, rtext, 7, rcolor, sel, maxw)
+        x = add_seg(stdscr, y, x, ttl, title_w, 0, sel, maxw)
+
+    footer = " ↑/↓ move · Enter open · y split · g back · r refresh · o browser · q detach "
+    try:
+        stdscr.attron(curses.A_DIM)
+        stdscr.addnstr(h - 1, 0, (status_line or footer)[:maxw], maxw)
+        stdscr.attroff(curses.A_DIM)
+    except curses.error:
+        pass
+    stdscr.refresh()
+
+
+def main(stdscr):
+    mark_cockpit()
+    curses.curs_set(0)
+    curses.use_default_colors()
+    for i, fg in [(3, curses.COLOR_GREEN), (4, curses.COLOR_RED),
+                  (5, curses.COLOR_YELLOW), (6, curses.COLOR_MAGENTA)]:
+        try:
+            curses.init_pair(i, fg, -1)
+        except curses.error:
+            pass
+    stdscr.timeout(1000)
+
+    tickets = load_tickets()
+    if not tickets:
+        fetch_blocking(stdscr)
+        tickets = load_tickets()
+
+    idx = 0
+    sel = read_selected()
+    if sel:
+        for i, t in enumerate(tickets):
+            if t.get("id") == sel:
+                idx = i
+                break
+    top = 0
+    last_fetch = time.time()
+    status_line = ""
+
+    while True:
+        live = live_tickets()
+        h, _ = stdscr.getmaxyx()
+        body_h = max(1, h - 3)
+        if idx < top:
+            top = idx
+        elif idx >= top + body_h:
+            top = idx - body_h + 1
+        if tickets:
+            write_selected(tickets[idx].get("id", ""))
+
+        draw(stdscr, tickets, idx, top, live, status_line)
+        status_line = ""
+
+        try:
+            c = stdscr.getch()
+        except KeyboardInterrupt:
+            c = -1
+
+        if c == -1:
+            if time.time() - last_fetch > REFETCH_SECONDS:
+                fetch_blocking(stdscr)
+                tickets = load_tickets()
+                last_fetch = time.time()
+            continue
+
+        if c in (curses.KEY_UP, ord("k")):
+            idx = max(0, idx - 1)
+        elif c in (curses.KEY_DOWN, ord("j")):
+            idx = min(len(tickets) - 1, idx + 1) if tickets else 0
+        elif c == curses.KEY_NPAGE:
+            idx = min(len(tickets) - 1, idx + body_h) if tickets else 0
+        elif c == curses.KEY_PPAGE:
+            idx = max(0, idx - body_h)
+        elif c in (curses.KEY_ENTER, 10, 13):
+            if tickets:
+                run_bg([os.path.join(BIN, "gl-open"), tickets[idx]["id"]])
+        elif c == ord("y"):
+            if tickets:
+                run_bg([os.path.join(BIN, "gl-split"), tickets[idx]["id"]])
+        elif c == ord("g"):
+            run_bg([os.path.join(BIN, "gl-return")])
+        elif c == ord("o"):
+            if tickets and tickets[idx].get("url"):
+                run_bg(["open", tickets[idx]["url"]])
+        elif c == ord("r"):
+            fetch_blocking(stdscr)
+            tickets = load_tickets()
+            last_fetch = time.time()
+            status_line = " refreshed "
+        elif c == ord("q"):
+            subprocess.run([TMUX, "detach-client"])
+
+
+if __name__ == "__main__":
+    while True:
+        try:
+            curses.wrapper(main)
+            break
+        except KeyboardInterrupt:
+            continue
+        except Exception as e:  # keep the window alive on unexpected errors
+            print(f"\n[ghostty-linear] dashboard error: {e}\nRestarting in 2s… (Ctrl-C to stop)")
+            time.sleep(2)

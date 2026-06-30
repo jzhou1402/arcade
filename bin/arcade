@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# arcade — start (or reattach to) the ghostty-linear Linear cockpit.
+# Type `arcade` in any Ghostty shell. Prints a short boot banner, then attaches
+# the tmux dashboard session (creating it if needed).
+set -euo pipefail
+
+GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
+# shellcheck source=gl-lib.sh
+. "$GL_CONFIG_DIR/bin/gl-lib.sh"
+
+# --- boot banner -------------------------------------------------------------
+c_dim=$'\033[2m'; c_b=$'\033[1m'; c_cy=$'\033[36m'; c_gr=$'\033[32m'; c_r=$'\033[0m'
+
+tmux_v="$("$TMUX_BIN" -V 2>/dev/null || echo 'tmux ?')"
+claude_v="$({ "${GL_CLAUDE:-claude}" --version 2>/dev/null || true; } | head -1)"
+[ -n "$claude_v" ] || claude_v="not found"
+
+if gl_session_exists; then
+  action="reattaching to live session"
+else
+  action="starting new session"
+fi
+
+# ticket cache freshness
+tickets_line="no cache yet — fetching"
+if [ -f "$GL_TICKETS" ]; then
+  n="$(jq 'length' "$GL_TICKETS" 2>/dev/null || echo '?')"
+  age_min="$(( ( $(date +%s) - $(stat -f %m "$GL_TICKETS" 2>/dev/null || echo 0) ) / 60 ))"
+  tickets_line="${n} tickets cached (${age_min}m old)"
+fi
+
+printf '\n'
+printf '%s  🕹  arcade %s%s%s  %s·  ghostty · tmux · linear cockpit%s\n' "$c_cy" "$c_b" "v$GL_VERSION" "$c_r" "$c_cy" "$c_r"
+printf '%s  ├─ build    %s%s “%s”%s\n' "$c_dim" "$c_r" "$c_dim" "$GL_CODENAME" "$c_r"
+printf '%s  ├─ %s · claude %s%s\n' "$c_dim" "$tmux_v" "$claude_v" "$c_r"
+printf '%s  ├─ session  %s%s%s%s   repo %s%s%s\n' "$c_dim" "$c_r" "$c_gr" "$GL_SESSION" "$c_dim" "$c_r" "${GL_REPO/#$HOME/~}" "$c_r"
+printf '%s  ├─ tickets  %s%s%s\n' "$c_dim" "$c_r" "$tickets_line" "$c_r"
+printf '%s  └─ %s%s%s\n' "$c_dim" "$c_b" "${action}…" "$c_r"
+printf '\n'
+
+# Brief, skippable pause so the banner registers before tmux takes the screen.
+sleep "${ARCADE_SPLASH:-0.6}" 2>/dev/null || true
+
+exec "$GL_BIN/gl-start"

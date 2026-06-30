@@ -1,0 +1,11 @@
+# Python bytecode (gl-dashboard)
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Runtime data lives in ~/.cache/ghostty-linear, not in the repo — but ignore
+# any stray local cache/state if someone points GL_CACHE here.
+/cache/
+*.local

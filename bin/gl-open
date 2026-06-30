@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Open a ticket. If the cockpit is currently split, swap it into the right pane
+# in place; otherwise ensure its window exists and switch to it full-screen.
+# usage: gl-open [TICKET-ID]   (defaults to the dashboard's current selection)
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+id="${1:-$(cat "$GL_SELECTED" 2>/dev/null || true)}"
+if [ -z "$id" ]; then gl_log "No ticket selected."; exit 1; fi
+if [ -z "$TMUX_BIN" ]; then gl_log "tmux not found."; exit 1; fi
+
+if gl_split_active; then
+  # Split view is up: swap this ticket into the right pane, stay on the dashboard.
+  gl_show_in_cockpit "$id"
+else
+  win="$(gl_ensure_window "$id")"
+  "$TMUX_BIN" select-window -t "$win"
+fi
+
+printf '%s\n' "$id" > "$GL_SELECTED"

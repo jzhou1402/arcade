@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Ghostty launches this as its default command. Refreshes tickets in the
+# background, then attaches (or creates) the dashboard tmux session.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+# Refresh tickets in the background if missing or older than 5 minutes.
+if [ ! -f "$GL_TICKETS" ] || [ -n "$(find "$GL_TICKETS" -mmin +5 2>/dev/null)" ]; then
+  ("$DIR/gl-fetch" >/dev/null 2>&1 &)
+fi
+
+exec "$TMUX_BIN" -f "$GL_CONFIG_DIR/tmux.conf" \
+  new-session -A -s "$GL_SESSION" -n "$GL_DASHBOARD_WINDOW" "exec $DIR/gl-dashboard"

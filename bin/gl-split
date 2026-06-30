@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# cmd+Y: toggle the cockpit split — dashboard pinned on the left, the selected
+# ticket's claude session on the right. While the split is up, selecting a
+# different ticket (Enter / cmd+Return) swaps the right pane in place.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+if [ -z "$TMUX_BIN" ]; then gl_log "tmux not found."; exit 1; fi
+
+cockpit="$(gl_cockpit_window || true)"
+if [ -z "$cockpit" ]; then gl_log "No cockpit window."; exit 1; fi
+
+if [ -n "$(gl_shown_ticket "$cockpit")" ]; then
+  # Already split -> collapse back to the full-screen dashboard.
+  gl_collapse_cockpit
+  exit 0
+fi
+
+id="${1:-$(cat "$GL_SELECTED" 2>/dev/null || true)}"
+if [ -z "$id" ]; then gl_log "No ticket selected."; exit 1; fi
+gl_show_in_cockpit "$id"

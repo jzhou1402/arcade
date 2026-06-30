@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Fetch assigned + active Linear tickets, discover each ticket's PR from its
+# Linear attachments, and enrich it with live GitHub state via `gh`.
+# Writes the result to $GL_TICKETS (tickets.json). Safe to run repeatedly.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+token="$(gl_token)"
+if [ -z "$token" ]; then
+  gl_log "No Linear API key. Run: $DIR/gl-setup"
+  exit 1
+fi
+
+read -r -d '' QUERY <<'GQL' || true
+query {
+  viewer {
+    assignedIssues(
+      first: 100
+      filter: { state: { type: { in: ["triage", "backlog", "unstarted", "started"] } } }
+    ) {
+      nodes { identifier title url branchName priority updatedAt state { name type } attachments { nodes { url } } }
+    }
+    createdIssues(
+      first: 100
+      filter: { state: { type: { in: ["triage", "backlog", "unstarted", "started"] } } }
+    ) {
+      nodes { identifier title url branchName priority updatedAt state { name type } attachments { nodes { url } } }
+    }
+  }
+}
+GQL
+
+resp="$(curl -s --max-time 20 https://api.linear.app/graphql \
+  -H "Authorization: $token" -H "Content-Type: application/json" \
+  -d "$(jq -n --arg q "$QUERY" '{query: $q}')")"
+
+if ! printf '%s' "$resp" | jq -e '.data.viewer' >/dev/null 2>&1; then
+  gl_log "Linear query failed: $(printf '%s' "$resp" | jq -c '.errors // .' 2>/dev/null || printf '%s' "$resp")"
+  exit 1
+fi
+
+# Union of issues assigned to me OR created by me (you don't always self-assign),
+# deduped by identifier. Linear is the source of truth for the linked PR (attachment URL).
+base="$(printf '%s' "$resp" | jq '
+  [ (.data.viewer.assignedIssues.nodes + .data.viewer.createdIssues.nodes)
+    | unique_by(.identifier) | .[] | {
+      id: .identifier,
+      title: .title,
+      url: .url,
+      branch: .branchName,
+      state: .state.name,
+      stateType: .state.type,
+      priority: (.priority // 0),
+      updatedAt: .updatedAt,
+      prUrl: ([ .attachments.nodes[].url
+                | select(test("github\\.com/.+/pull/[0-9]+")) ] | first // null),
+      pr: null
+    } ]
+  | sort_by([ (if .stateType == "started" then 0 else 1 end),
+              (if .priority == 0 then 5 else .priority end),
+              .updatedAt ])
+')"
+
+tmp="$(mktemp)"
+printf '%s' "$base" > "$tmp"
+
+# GitHub is the source of truth for PR *state*: CI, review, mergeability, size.
+if command -v gh >/dev/null 2>&1; then
+  count="$(jq 'length' "$tmp")"
+  for i in $(seq 0 $((count - 1))); do
+    prurl="$(jq -r ".[$i].prUrl // empty" "$tmp")"
+    branch="$(jq -r ".[$i].branch // empty" "$tmp")"
+
+    raw=""
+    if [ -n "$prurl" ]; then
+      raw="$(gh pr view "$prurl" \
+        --json number,state,isDraft,reviewDecision,mergeable,additions,deletions,changedFiles,statusCheckRollup \
+        2>/dev/null || true)"
+    elif [ -n "$branch" ] && [ -d "$GL_REPO/.git" ]; then
+      raw="$(gh pr list --repo "$(gh repo view "$GL_REPO" --json nameWithOwner -q .nameWithOwner 2>/dev/null)" \
+        --head "$branch" --state all --limit 1 \
+        --json number,state,isDraft,reviewDecision,mergeable,additions,deletions,changedFiles,statusCheckRollup \
+        2>/dev/null | jq '.[0] // empty' || true)"
+    fi
+
+    pr="null"
+    if [ -n "$raw" ] && [ "$raw" != "null" ]; then
+      pr="$(printf '%s' "$raw" | jq '{
+        number,
+        state,
+        draft: .isDraft,
+        review: ((.reviewDecision // "")
+          | if . == "APPROVED" then "approved"
+            elif . == "CHANGES_REQUESTED" then "changes"
+            elif . == "REVIEW_REQUIRED" then "review"
+            else "" end),
+        mergeable: (.mergeable // "UNKNOWN"),
+        add: .additions, del: .deletions, files: .changedFiles,
+        checks: ((.statusCheckRollup // []) | if length == 0 then "none"
+          elif any(.[]; .conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "CANCELLED" or .conclusion == "ACTION_REQUIRED") then "fail"
+          elif any(.[]; (.status // "COMPLETED") != "COMPLETED") then "pending"
+          else "pass" end)
+      }')"
+    fi
+    jq --argjson pr "$pr" --argjson i "$i" '.[$i].pr = $pr' "$tmp" > "$tmp.next" && mv "$tmp.next" "$tmp"
+  done
+fi
+
+mv "$tmp" "$GL_TICKETS"
+gl_log "Wrote $(jq 'length' "$GL_TICKETS") tickets to $GL_TICKETS"

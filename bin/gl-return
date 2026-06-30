@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# cmd+G: jump back to the dashboard window without touching running sessions.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+"$TMUX_BIN" select-window -t "$GL_SESSION:$GL_DASHBOARD_WINDOW" 2>/dev/null \
+  || "$TMUX_BIN" new-window -t "$GL_SESSION" -n "$GL_DASHBOARD_WINDOW" "exec $GL_BIN/gl-dashboard"
+
+# If the cockpit is split, land on the dashboard pane (not the claude pane).
+cockpit="$(gl_cockpit_window || true)"
+if [ -n "$cockpit" ]; then
+  dash="$("$TMUX_BIN" show-window-options -t "$GL_SESSION:$cockpit" -v @dashpane 2>/dev/null || true)"
+  [ -n "$dash" ] && "$TMUX_BIN" select-pane -t "$dash" 2>/dev/null || true
+fi

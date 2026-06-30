@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# One-time setup: store your Linear personal API key in the macOS Keychain.
+# Get a key at https://linear.app/settings/api  (Personal API keys -> create).
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+echo "Paste your Linear personal API key (from https://linear.app/settings/api)."
+echo "Input is hidden; it will be stored in the macOS Keychain (service: $GL_KEYCHAIN_SERVICE)."
+printf 'Linear API key: '
+read -rs key
+echo
+
+if [ -z "$key" ]; then
+  echo "No key entered; aborting." >&2
+  exit 1
+fi
+
+security add-generic-password -U -s "$GL_KEYCHAIN_SERVICE" -a "$USER" -w "$key"
+echo "Stored. Verifying it works..."
+
+resp="$(curl -s https://api.linear.app/graphql \
+  -H "Authorization: $key" -H "Content-Type: application/json" \
+  -d '{"query":"{ viewer { name email } }"}')"
+
+name="$(printf '%s' "$resp" | jq -r '.data.viewer.name // empty')"
+if [ -n "$name" ]; then
+  echo "OK — authenticated as $name."
+  echo "Fetching your tickets..."
+  "$DIR/gl-fetch" || true
+  echo "Done. Launch the dashboard with:  $DIR/gl-dashboard"
+else
+  echo "Key stored but the test query failed. Response:" >&2
+  printf '%s\n' "$resp" >&2
+  exit 1
+fi
