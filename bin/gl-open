@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Open a ticket. If the cockpit is currently split, swap it into the right pane
-# in place; otherwise ensure its window exists and switch to it full-screen.
+# Open a ticket. In split view, Enter full-screens (zooms) the ticket's claude;
+# otherwise ensure its window exists and switch to it full-screen.
 # usage: gl-open [TICKET-ID]   (defaults to the dashboard's current selection)
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,8 +12,17 @@ if [ -z "$id" ]; then gl_log "No ticket selected."; exit 1; fi
 if [ -z "$TMUX_BIN" ]; then gl_log "tmux not found."; exit 1; fi
 
 if gl_split_active; then
-  # Split view is up: swap this ticket into the right pane, stay on the dashboard.
+  # Split view is up: bring this ticket into the right pane and full-screen it
+  # (zoom). Ctrl-b z, or cmd+` (back to dashboard), restores the split.
   gl_show_in_cockpit "$id"
+  cockpit="$(gl_cockpit_window)"
+  claude="$(gl_cockpit_claude_pane "$cockpit")"
+  if [ -n "$claude" ]; then
+    "$TMUX_BIN" select-pane -t "$claude"   # auto-unzooms any other zoomed pane
+    if [ "$("$TMUX_BIN" display-message -p -t "$cockpit" '#{window_zoomed_flag}')" != "1" ]; then
+      "$TMUX_BIN" resize-pane -Z -t "$claude"
+    fi
+  fi
 else
   win="$(gl_ensure_window "$id")"
   "$TMUX_BIN" select-window -t "$win"

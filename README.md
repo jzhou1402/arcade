@@ -26,7 +26,7 @@ worktree, briefed via the Linear + GitHub MCPs), and flip between them.
 | Key | Where | Action |
 |-----|-------|--------|
 | `↑`/`↓` (or `j`/`k`) | dashboard | move selection (paginates the list) |
-| `Enter` | dashboard | open the selected ticket — attach if its session is live, else create it |
+| `Enter` | dashboard | open the selected ticket — attach if live, else create it. In split view, full-screens (zooms) its claude |
 | `cmd+Return` | anywhere | open/attach the selected ticket (same as Enter, works from inside a session) |
 | `` cmd+` `` | anywhere | jump back to the dashboard (sessions keep running) |
 | `cmd+Y` | anywhere | toggle the **cockpit split**: dashboard pinned left, the selected ticket's claude on the right. Press again to close it |
@@ -38,10 +38,12 @@ worktree, briefed via the Linear + GitHub MCPs), and flip between them.
 selected ticket's claude on the right, in one window you stay in. While it's
 open, **moving the selection live-previews that ticket's claude on the right**
 (after a brief settle) — but only for tickets that already have a running
-session; press `Enter` to start one that doesn't. Focus stays on the dashboard
-so you can keep cycling; click the right pane (or `C-b →`) to type into claude,
-and `C-b z` to zoom it full-screen. The layout is fixed (dashboard always left),
-so if a pane ever ends up out of place it snaps back on the next toggle/preview.
+session. Press **`Enter` to full-screen (zoom) the selected ticket's claude**
+(starting it first if needed); `` cmd+` `` (back to dashboard) or `C-b z`
+restores the split. Focus stays on the dashboard while cycling; click the right
+pane (or `C-b →`) to type into claude. The layout is fixed (dashboard always
+left), so if a pane ever ends up out of place it snaps back on the next
+toggle/preview.
 
 `cmd+Return`/`` cmd+` ``/`cmd+Y` are Ghostty keybinds that send the tmux prefix
 (`C-b`) + `n/g/y`; the matching tmux bindings live in `tmux.conf`. (`cmd+Return`
