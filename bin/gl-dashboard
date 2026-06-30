@@ -57,6 +57,21 @@ def live_tickets():
         return set()
 
 
+def cockpit_shown():
+    """Ticket currently joined into the cockpit's right pane ("" if none)."""
+    try:
+        out = subprocess.run(
+            [TMUX, "list-windows", "-t", SESSION, "-F", "#{@shown}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        for ln in out.stdout.splitlines():
+            if ln.strip():
+                return ln.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def write_selected(ticket_id):
     try:
         with open(SELECTED, "w") as f:
@@ -143,7 +158,7 @@ def add_seg(stdscr, y, x, text, width, color, selected, maxw):
     return x + len(cell)
 
 
-def draw(stdscr, tickets, idx, top, live, status_line):
+def draw(stdscr, tickets, idx, top, live, status_line, shown=""):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     title = "  Linear — my active tickets"
@@ -183,7 +198,9 @@ def draw(stdscr, tickets, idx, top, live, status_line):
         x = add_seg(stdscr, y, x, rtext, 7, rcolor, sel, maxw)
         x = add_seg(stdscr, y, x, ttl, title_w, 0, sel, maxw)
 
-    footer = " ↑/↓ move · Enter open · y split · g back · r refresh · o browser · q detach "
+    split = f" · ▶ {shown}" if shown else ""
+    footer = (" ↑/↓ move · Enter open · y split" + split +
+              " · g back · r refresh · o browser · q detach ")
     try:
         stdscr.attron(curses.A_DIM)
         stdscr.addnstr(h - 1, 0, (status_line or footer)[:maxw], maxw)
@@ -203,7 +220,12 @@ def main(stdscr):
             curses.init_pair(i, fg, -1)
         except curses.error:
             pass
-    stdscr.timeout(1000)
+    # Short poll so cycling feels live; expensive work (tmux queries, re-marking
+    # the cockpit) is throttled below so we don't spawn subprocesses 8×/sec.
+    stdscr.timeout(120)
+    POLL_SECS = 1.0          # how often to re-query tmux for live/split state
+    MARK_SECS = 2.0          # how often to re-assert @cockpit/@dashpane
+    PREVIEW_DEBOUNCE = 0.22  # settle time before previewing the selection
 
     tickets = load_tickets()
     if not tickets:
@@ -218,11 +240,32 @@ def main(stdscr):
                 idx = i
                 break
     top = 0
-    last_fetch = time.time()
+    now = time.time()
+    last_fetch = now
+    last_poll = 0.0
+    last_mark = 0.0
+    live = set()
+    shown = ""
+    pending = None       # ticket id whose preview is waiting to settle
+    pending_ts = 0.0
     status_line = ""
 
     while True:
-        live = live_tickets()
+        now = time.time()
+
+        if now - last_mark >= MARK_SECS:
+            mark_cockpit()
+            last_mark = now
+
+        if now - last_poll >= POLL_SECS:
+            live = live_tickets()
+            shown = cockpit_shown()
+            last_poll = now
+            if now - last_fetch > REFETCH_SECONDS:
+                fetch_blocking(stdscr)
+                tickets = load_tickets()
+                last_fetch = time.time()
+
         h, _ = stdscr.getmaxyx()
         body_h = max(1, h - 3)
         if idx < top:
@@ -232,7 +275,14 @@ def main(stdscr):
         if tickets:
             write_selected(tickets[idx].get("id", ""))
 
-        draw(stdscr, tickets, idx, top, live, status_line)
+        # Fire the preview once the selection has settled (avoids thrashing the
+        # join/break swap while the user holds j/k). gl-preview no-ops unless
+        # the split is up and the ticket is already live.
+        if pending is not None and now - pending_ts >= PREVIEW_DEBOUNCE:
+            run_bg([os.path.join(BIN, "gl-preview"), pending])
+            pending = None
+
+        draw(stdscr, tickets, idx, top, live, status_line, shown)
         status_line = ""
 
         try:
@@ -241,26 +291,25 @@ def main(stdscr):
             c = -1
 
         if c == -1:
-            if time.time() - last_fetch > REFETCH_SECONDS:
-                fetch_blocking(stdscr)
-                tickets = load_tickets()
-                last_fetch = time.time()
             continue
 
+        moved = False
         if c in (curses.KEY_UP, ord("k")):
-            idx = max(0, idx - 1)
+            idx = max(0, idx - 1); moved = True
         elif c in (curses.KEY_DOWN, ord("j")):
-            idx = min(len(tickets) - 1, idx + 1) if tickets else 0
+            idx = min(len(tickets) - 1, idx + 1) if tickets else 0; moved = True
         elif c == curses.KEY_NPAGE:
-            idx = min(len(tickets) - 1, idx + body_h) if tickets else 0
+            idx = min(len(tickets) - 1, idx + body_h) if tickets else 0; moved = True
         elif c == curses.KEY_PPAGE:
-            idx = max(0, idx - body_h)
+            idx = max(0, idx - body_h); moved = True
         elif c in (curses.KEY_ENTER, 10, 13):
             if tickets:
                 run_bg([os.path.join(BIN, "gl-open"), tickets[idx]["id"]])
+                pending = None
         elif c == ord("y"):
             if tickets:
                 run_bg([os.path.join(BIN, "gl-split"), tickets[idx]["id"]])
+                pending = None
         elif c == ord("g"):
             run_bg([os.path.join(BIN, "gl-return")])
         elif c == ord("o"):
@@ -273,6 +322,10 @@ def main(stdscr):
             status_line = " refreshed "
         elif c == ord("q"):
             subprocess.run([TMUX, "detach-client"])
+
+        if moved and tickets:
+            pending = tickets[idx].get("id", "")
+            pending_ts = now
 
 
 if __name__ == "__main__":

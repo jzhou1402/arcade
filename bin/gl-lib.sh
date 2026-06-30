@@ -17,7 +17,7 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.2.0"
+GL_VERSION="0.3.0"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
@@ -107,11 +107,19 @@ gl_log() { printf '[ghostty-linear] %s\n' "$*" >&2; }
 # @dashpane at startup. @shown (set on the cockpit) is the ticket id currently
 # displayed on the right, or empty when the dashboard is full-screen.
 
-# Window index of the cockpit (the dashboard window).
+# Window index of the cockpit (the dashboard window). Prefers the @cockpit
+# marker (set by gl-dashboard), falling back to the window named "dashboard"
+# so a stale/un-marked session still resolves.
 gl_cockpit_window() {
   [ -n "$TMUX_BIN" ] || return 1
-  "$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_index}|#{@cockpit}' 2>/dev/null \
-    | awk -F'|' '$2 == "1" { print $1; exit }'
+  local idx
+  idx="$("$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_index}|#{@cockpit}' 2>/dev/null \
+    | awk -F'|' '$2 == "1" { print $1; exit }')"
+  if [ -z "$idx" ]; then
+    idx="$("$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_index}|#{window_name}' 2>/dev/null \
+      | awk -F'|' -v n="$GL_DASHBOARD_WINDOW" '$2 == n { print $1; exit }')"
+  fi
+  printf '%s' "$idx"
 }
 
 # Ticket currently shown on the cockpit's right (empty if none).
@@ -126,10 +134,27 @@ gl_split_active() {
   [ -n "$cockpit" ] && [ -n "$(gl_shown_ticket "$cockpit")" ]
 }
 
+# Resolve the cockpit's dashboard pane id, self-healing against stale @dashpane
+# values (tmux-resurrect assigns new pane ids on restore). Prefers @dashpane if
+# it still names a live pane in the cockpit; otherwise finds the pane running
+# the dashboard (python); last resort, the first pane.
+gl_resolve_dashpane() {
+  local cockpit="$1" stored p cmd
+  stored="$("$TMUX_BIN" show-window-options -t "$GL_SESSION:$cockpit" -v @dashpane 2>/dev/null || true)"
+  if [ -n "$stored" ] \
+     && "$TMUX_BIN" list-panes -t "$GL_SESSION:$cockpit" -F '#{pane_id}' 2>/dev/null | grep -qx "$stored"; then
+    printf '%s' "$stored"; return 0
+  fi
+  while IFS='|' read -r p cmd; do
+    case "$cmd" in *[Pp]ython*) printf '%s' "$p"; return 0;; esac
+  done < <("$TMUX_BIN" list-panes -t "$GL_SESSION:$cockpit" -F '#{pane_id}|#{pane_current_command}' 2>/dev/null)
+  "$TMUX_BIN" list-panes -t "$GL_SESSION:$cockpit" -F '#{pane_id}' 2>/dev/null | head -1
+}
+
 # The cockpit's right-hand (claude) pane: the pane that is NOT the dashboard.
 gl_cockpit_claude_pane() {
   local cockpit="$1" dash
-  dash="$("$TMUX_BIN" show-window-options -t "$GL_SESSION:$cockpit" -v @dashpane 2>/dev/null || true)"
+  dash="$(gl_resolve_dashpane "$cockpit")"
   "$TMUX_BIN" list-panes -t "$GL_SESSION:$cockpit" -F '#{pane_id}' 2>/dev/null \
     | grep -vx "$dash" | head -1
 }
@@ -219,8 +244,14 @@ gl_show_in_cockpit() {
   gl_collapse_cockpit                        # park the previous ticket
   winid="$(gl_ensure_window "$id")"
   srcpane="$("$TMUX_BIN" list-panes -t "$winid" -F '#{pane_id}' | head -1)"
-  dash="$("$TMUX_BIN" show-window-options -t "$GL_SESSION:$cockpit" -v @dashpane 2>/dev/null || true)"
+  # Resolve the dashboard pane *after* collapse, so the cockpit is back to a
+  # single (dashboard) pane and the layout comes out deterministic: joining to
+  # the right of the dashboard always yields dashboard-left / claude-right,
+  # regardless of any manual pane shuffling the user did.
+  dash="$(gl_resolve_dashpane "$cockpit")"
   [ -n "$dash" ] || { gl_log "Cockpit has no dashboard pane."; return 1; }
+  # Re-pin @dashpane to the live id so later collapses target the right pane.
+  "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @dashpane "$dash" >/dev/null 2>&1 || true
 
   "$TMUX_BIN" join-pane -h -l '55%' -s "$srcpane" -t "$dash"
   "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown "$id" >/dev/null

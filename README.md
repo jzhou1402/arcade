@@ -28,15 +28,24 @@ worktree, briefed via the Linear + GitHub MCPs), and flip between them.
 | `↑`/`↓` (or `j`/`k`) | dashboard | move selection (paginates the list) |
 | `Enter` | dashboard | open the selected ticket — attach if its session is live, else create it |
 | `cmd+Return` | anywhere | open/attach the selected ticket (same as Enter, works from inside a session) |
-| `cmd+Escape` | anywhere | jump back to the dashboard (sessions keep running) |
-| `cmd+Y` | anywhere | toggle split: dashboard on the left, the ticket's claude on the right. While split, selecting another ticket swaps the right pane in place |
+| `` cmd+` `` | anywhere | jump back to the dashboard (sessions keep running) |
+| `cmd+Y` | anywhere | toggle the **cockpit split**: dashboard pinned left, the selected ticket's claude on the right. Press again to close it |
 | `r` | dashboard | refresh tickets from Linear + GitHub now |
 | `o` | dashboard | open the selected ticket in the browser |
 | `q` | dashboard | detach (reopen Ghostty to reattach) |
 
-`cmd+Return/Escape/Y` are Ghostty keybinds that send the tmux prefix (`C-b`) +
-`n/g/y`; the matching tmux bindings live in `tmux.conf`. (`cmd+Return` overrides
-Ghostty's default fullscreen toggle.)
+**Cockpit split (single window).** `cmd+Y` puts the dashboard on the left and the
+selected ticket's claude on the right, in one window you stay in. While it's
+open, **moving the selection live-previews that ticket's claude on the right**
+(after a brief settle) — but only for tickets that already have a running
+session; press `Enter` to start one that doesn't. Focus stays on the dashboard
+so you can keep cycling; click the right pane (or `C-b →`) to type into claude,
+and `C-b z` to zoom it full-screen. The layout is fixed (dashboard always left),
+so if a pane ever ends up out of place it snaps back on the next toggle/preview.
+
+`cmd+Return`/`` cmd+` ``/`cmd+Y` are Ghostty keybinds that send the tmux prefix
+(`C-b`) + `n/g/y`; the matching tmux bindings live in `tmux.conf`. (`cmd+Return`
+overrides Ghostty's default fullscreen toggle.)
 
 ## What a spawned session gets
 
@@ -78,6 +87,7 @@ resurrect attempts `claude --continue` to resume the conversation.
   bin/gl-fetch         # Linear + GitHub -> tickets.json
   bin/gl-dashboard     # the curses status page
   bin/gl-open          # ensure worktree + claude window; swap into split or switch
+  bin/gl-preview       # live-preview a live ticket in the split (no creation)
   bin/gl-brief         # build the per-ticket markdown brief
   bin/gl-split         # toggle the cockpit split
   bin/gl-return        # back to dashboard
