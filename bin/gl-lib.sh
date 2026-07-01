@@ -17,7 +17,7 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.4.0"
+GL_VERSION="0.5.0"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
@@ -152,11 +152,13 @@ gl_resolve_dashpane() {
 }
 
 # The cockpit's right-hand (claude) pane: the pane that is NOT the dashboard.
+# Prints nothing (exit 0) when there is no such pane — the trailing `|| true`
+# keeps grep's "no match" (exit 1) from tripping set -e/pipefail in callers.
 gl_cockpit_claude_pane() {
   local cockpit="$1" dash
   dash="$(gl_resolve_dashpane "$cockpit")"
   "$TMUX_BIN" list-panes -t "$GL_SESSION:$cockpit" -F '#{pane_id}' 2>/dev/null \
-    | grep -vx "$dash" | head -1
+    | grep -vx "$dash" | head -1 || true
 }
 
 # Ensure a tmux window running claude exists for a ticket; echo its window id
@@ -179,15 +181,19 @@ gl_ensure_window() {
     wt="$GL_REPO"
   elif [ ! -d "$wt" ]; then
     gl_log "Creating worktree $wt on branch $branch ..."
-    if git -C "$GL_REPO" show-ref --verify --quiet "refs/heads/$branch"; then
-      git -C "$GL_REPO" worktree add "$wt" "$branch"
-    elif git -C "$GL_REPO" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-      git -C "$GL_REPO" fetch origin "$branch" >/dev/null 2>&1 || true
-      git -C "$GL_REPO" worktree add --track -b "$branch" "$wt" "origin/$branch"
-    else
-      git -C "$GL_REPO" worktree add -b "$branch" "$wt" "origin/$GL_BASE_BRANCH" 2>/dev/null \
-        || git -C "$GL_REPO" worktree add -b "$branch" "$wt" "$GL_BASE_BRANCH"
-    fi
+    # Redirect git's progress to stderr: this function's stdout is captured for
+    # the window id, so any stray git chatter would corrupt it.
+    {
+      if git -C "$GL_REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$GL_REPO" worktree add "$wt" "$branch"
+      elif git -C "$GL_REPO" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+        git -C "$GL_REPO" fetch origin "$branch" >/dev/null 2>&1 || true
+        git -C "$GL_REPO" worktree add --track -b "$branch" "$wt" "origin/$branch"
+      else
+        git -C "$GL_REPO" worktree add -b "$branch" "$wt" "origin/$GL_BASE_BRANCH" 2>/dev/null \
+          || git -C "$GL_REPO" worktree add -b "$branch" "$wt" "$GL_BASE_BRANCH"
+      fi
+    } 1>&2
   fi
 
   brief="$("$GL_BIN/gl-brief" "$id" 2>/dev/null || true)"
@@ -212,49 +218,111 @@ Then give me a concise summary of the task and its current state (Linear status 
   printf '%s' "$win"
 }
 
-# Collapse the split: break the currently-shown claude pane back out to its own
-# standalone window (restoring its @ticket + title) and clear @shown.
-gl_collapse_cockpit() {
-  local cockpit shown right title newwin
-  cockpit="$(gl_cockpit_window)" || return 0
+# Kind of thing currently on the cockpit's right: "claude", "blank", or "".
+gl_shown_kind() {
+  "$TMUX_BIN" show-window-options -t "$GL_SESSION:$1" -v @shown_kind 2>/dev/null || true
+}
+
+# Focus helpers: the dashboard pane (left) or whatever is on the right.
+gl_focus_dash()  { "$TMUX_BIN" select-pane -t "$(gl_resolve_dashpane "$1")" 2>/dev/null || true; }
+gl_focus_right() {
+  local p; p="$(gl_cockpit_claude_pane "$1")"
+  [ -n "$p" ] && "$TMUX_BIN" select-pane -t "$p" 2>/dev/null || true
+}
+
+# Clear whatever occupies the cockpit's right pane: a real claude is broken back
+# out to its own standalone window (restoring @ticket + title) so its session
+# survives; a blank placeholder is just killed. Clears @shown/@shown_kind.
+gl_clear_right() {
+  local cockpit="$1" shown kind right title newwin
   [ -n "$cockpit" ] || return 0
   shown="$(gl_shown_ticket "$cockpit")"
-  [ -n "$shown" ] || return 0
-
+  kind="$(gl_shown_kind "$cockpit")"
   right="$(gl_cockpit_claude_pane "$cockpit")"
   if [ -n "$right" ]; then
-    title="$(gl_title "$shown")"
-    newwin="$("$TMUX_BIN" break-pane -d -s "$right" -n "$title" -P -F '#{window_id}')"
-    "$TMUX_BIN" set-window-option -t "$newwin" @ticket "$shown" >/dev/null 2>&1 || true
-    "$TMUX_BIN" set-window-option -t "$newwin" automatic-rename off >/dev/null 2>&1 || true
-    "$TMUX_BIN" set-window-option -t "$newwin" allow-rename off >/dev/null 2>&1 || true
+    if [ "$kind" = "blank" ]; then
+      "$TMUX_BIN" kill-pane -t "$right" 2>/dev/null || true
+    else
+      title="$(gl_title "$shown")"
+      newwin="$("$TMUX_BIN" break-pane -d -s "$right" -n "$title" -P -F '#{window_id}' 2>/dev/null)" || newwin=""
+      if [ -n "$newwin" ]; then
+        "$TMUX_BIN" set-window-option -t "$newwin" @ticket "$shown" >/dev/null 2>&1 || true
+        "$TMUX_BIN" set-window-option -t "$newwin" automatic-rename off >/dev/null 2>&1 || true
+        "$TMUX_BIN" set-window-option -t "$newwin" allow-rename off >/dev/null 2>&1 || true
+      fi
+    fi
   fi
   "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown_kind >/dev/null 2>&1 || true
 }
 
-# Show ticket $1 on the cockpit's right, swapping out whatever was there.
-# Keeps focus on the dashboard so the user can keep navigating.
-gl_show_in_cockpit() {
-  local id="$1" cockpit shown winid srcpane dash
+# Collapse the split entirely (cmd+Y off): clear the right pane, leaving the
+# dashboard full-screen.
+gl_collapse_cockpit() {
+  local cockpit; cockpit="$(gl_cockpit_window)" || return 0
+  [ -n "$cockpit" ] || return 0
+  [ -n "$(gl_shown_ticket "$cockpit")" ] || return 0
+  gl_clear_right "$cockpit"
+}
+
+# Resolve + re-pin the dashboard pane, returning its id (used right before a
+# join/split so the layout is deterministic: dashboard-left / content-right).
+_gl_cockpit_dash() {
+  local cockpit="$1" dash
+  dash="$(gl_resolve_dashpane "$cockpit")"
+  [ -n "$dash" ] || return 1
+  "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @dashpane "$dash" >/dev/null 2>&1 || true
+  printf '%s' "$dash"
+}
+
+# Show ticket $1's claude on the cockpit's right (creating the worktree/window
+# if needed via gl_ensure_window). Does NOT change focus — callers decide.
+gl_show_claude() {
+  local id="$1" cockpit winid srcpane dash
   cockpit="$(gl_cockpit_window)" || { gl_log "No cockpit window."; return 1; }
   [ -n "$cockpit" ] || { gl_log "No cockpit window."; return 1; }
-  shown="$(gl_shown_ticket "$cockpit")"
-  [ "$shown" = "$id" ] && return 0           # already displayed
+  if [ "$(gl_shown_ticket "$cockpit")" = "$id" ] && [ "$(gl_shown_kind "$cockpit")" = "claude" ]; then
+    return 0                                   # already showing this claude
+  fi
 
-  gl_collapse_cockpit                        # park the previous ticket
+  gl_clear_right "$cockpit"
   winid="$(gl_ensure_window "$id")"
   srcpane="$("$TMUX_BIN" list-panes -t "$winid" -F '#{pane_id}' | head -1)"
-  # Resolve the dashboard pane *after* collapse, so the cockpit is back to a
-  # single (dashboard) pane and the layout comes out deterministic: joining to
-  # the right of the dashboard always yields dashboard-left / claude-right,
-  # regardless of any manual pane shuffling the user did.
-  dash="$(gl_resolve_dashpane "$cockpit")"
-  [ -n "$dash" ] || { gl_log "Cockpit has no dashboard pane."; return 1; }
-  # Re-pin @dashpane to the live id so later collapses target the right pane.
-  "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @dashpane "$dash" >/dev/null 2>&1 || true
-
+  dash="$(_gl_cockpit_dash "$cockpit")" || { gl_log "Cockpit has no dashboard pane."; return 1; }
   "$TMUX_BIN" join-pane -h -l '55%' -s "$srcpane" -t "$dash"
   "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown "$id" >/dev/null
+  "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown_kind claude >/dev/null
   "$TMUX_BIN" select-window -t "$GL_SESSION:$cockpit" >/dev/null
-  "$TMUX_BIN" select-pane -t "$dash" >/dev/null    # keep focus on the dashboard
 }
+
+# Show a blank placeholder for ticket $1 on the cockpit's right (no session yet:
+# prompts cmd+Enter to start one). Does NOT change focus.
+gl_show_blank() {
+  local id="$1" cockpit dash
+  cockpit="$(gl_cockpit_window)" || { gl_log "No cockpit window."; return 1; }
+  [ -n "$cockpit" ] || { gl_log "No cockpit window."; return 1; }
+  if [ "$(gl_shown_ticket "$cockpit")" = "$id" ] && [ "$(gl_shown_kind "$cockpit")" = "blank" ]; then
+    return 0                                   # already showing this placeholder
+  fi
+
+  gl_clear_right "$cockpit"
+  dash="$(_gl_cockpit_dash "$cockpit")" || { gl_log "Cockpit has no dashboard pane."; return 1; }
+  "$TMUX_BIN" split-window -h -l '55%' -t "$dash" "exec $GL_BIN/gl-placeholder $(printf '%q' "$id")"
+  "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown "$id" >/dev/null
+  "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown_kind blank >/dev/null
+  "$TMUX_BIN" select-window -t "$GL_SESSION:$cockpit" >/dev/null
+}
+
+# Put ticket $1 on the right: its claude if a session is already live, else a
+# blank placeholder. Never creates a session (use gl_show_claude to create).
+gl_show_ticket() {
+  local id="$1"
+  if [ -n "$(gl_window_for "$id")" ]; then
+    gl_show_claude "$id"
+  else
+    gl_show_blank "$id"
+  fi
+}
+
+# Back-compat alias.
+gl_show_in_cockpit() { gl_show_claude "$1"; }

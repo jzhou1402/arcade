@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# cmd+`: cycle the cockpit's right pane to the NEXT ticket (wrapping through the
+# dashboard's list). Live tickets show their claude; ticketless ones show a
+# blank "cmd+Enter to start" placeholder. Focus stays on the right pane so you
+# can keep typing. No-op unless the split is active.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+[ -n "$TMUX_BIN" ] || exit 0
+gl_split_active || exit 0
+
+cockpit="$(gl_cockpit_window)"
+
+# Ordered ticket ids from the cached list (the same order the dashboard shows).
+# Plain read loop (not mapfile) so this works on macOS's stock bash 3.2 too.
+ids=()
+while IFS= read -r _line; do
+  [ -n "$_line" ] && ids+=("$_line")
+done < <(jq -r '.[].id' "$GL_TICKETS" 2>/dev/null)
+[ "${#ids[@]}" -gt 0 ] || exit 0
+
+# Current = what's shown (fall back to the saved selection).
+cur="$(gl_shown_ticket "$cockpit")"
+[ -n "$cur" ] || cur="$(cat "$GL_SELECTED" 2>/dev/null || true)"
+
+# Find cur, pick the next id (wrap). If cur isn't in the list, start at the top.
+next="${ids[0]}"
+for i in "${!ids[@]}"; do
+  if [ "${ids[$i]}" = "$cur" ]; then
+    next="${ids[$(( (i + 1) % ${#ids[@]} ))]}"
+    break
+  fi
+done
+
+printf '%s\n' "$next" > "$GL_SELECTED"
+gl_show_ticket "$next"
+gl_focus_right "$cockpit"     # keep the cursor on the right so typing just works

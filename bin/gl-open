@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Open a ticket. In split view, Enter full-screens (zooms) the ticket's claude;
-# otherwise ensure its window exists and switch to it full-screen.
+# cmd+Enter: ensure a claude session for the ticket and put the cursor in it.
+# In split view: if the ticket already has a session, full-screen (zoom) it; if
+# it was blank/new, start the session and land in the normal split (un-zoomed).
+# Outside split: ensure its window exists and switch to it full-screen.
 # usage: gl-open [TICKET-ID]   (defaults to the dashboard's current selection)
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,13 +14,21 @@ if [ -z "$id" ]; then gl_log "No ticket selected."; exit 1; fi
 if [ -z "$TMUX_BIN" ]; then gl_log "tmux not found."; exit 1; fi
 
 if gl_split_active; then
-  # Split view is up: bring this ticket into the right pane and full-screen it
-  # (zoom). Ctrl-b z, or cmd+` (back to dashboard), restores the split.
-  gl_show_in_cockpit "$id"
   cockpit="$(gl_cockpit_window)"
+  # Was there already a session? (a standalone window, or the one shown now)
+  was_live=0
+  if [ -n "$(gl_window_for "$id")" ]; then
+    was_live=1
+  elif [ "$(gl_shown_ticket "$cockpit")" = "$id" ] && [ "$(gl_shown_kind "$cockpit")" = "claude" ]; then
+    was_live=1
+  fi
+
+  gl_show_claude "$id"               # creates the session if it was blank/new
   claude="$(gl_cockpit_claude_pane "$cockpit")"
-  if [ -n "$claude" ]; then
-    "$TMUX_BIN" select-pane -t "$claude"   # auto-unzooms any other zoomed pane
+  if [ -n "$claude" ]; then "$TMUX_BIN" select-pane -t "$claude"; fi   # cursor into claude
+
+  if [ "$was_live" = "1" ] && [ -n "$claude" ]; then
+    # Already had a session -> full-screen it. cmd+escape / Ctrl-b z restores.
     if [ "$("$TMUX_BIN" display-message -p -t "$cockpit" '#{window_zoomed_flag}')" != "1" ]; then
       "$TMUX_BIN" resize-pane -Z -t "$claude"
     fi

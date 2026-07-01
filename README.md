@@ -26,27 +26,28 @@ worktree, briefed via the Linear + GitHub MCPs), and flip between them.
 | Key | Where | Action |
 |-----|-------|--------|
 | `↑`/`↓` (or `j`/`k`) | dashboard | move selection (paginates the list) |
-| `Enter` | dashboard | open the selected ticket — attach if live, else create it. In split view, full-screens (zooms) its claude |
-| `cmd+Return` | anywhere | open/attach the selected ticket (same as Enter, works from inside a session) |
-| `` cmd+` `` | anywhere | jump back to the dashboard (sessions keep running) |
-| `cmd+Y` | anywhere | toggle the **cockpit split**: dashboard pinned left, the selected ticket's claude on the right. Press again to close it |
+| `cmd+Y` | anywhere | toggle the **cockpit split**: dashboard pinned left, selected ticket on the right. Press again to close |
+| `` cmd+` `` | split | **cycle** the right pane to the next ticket (cursor stays on the right) |
+| `cmd+Return` | anywhere | start the ticket's session if it has none; if it already has one, full-screen (zoom) it |
+| `cmd+Escape` | anywhere | jump focus back to the dashboard (also un-zooms) |
+| `Enter` | dashboard | same as cmd+Return for the highlighted ticket |
 | `r` | dashboard | refresh tickets from Linear + GitHub now |
 | `o` | dashboard | open the selected ticket in the browser |
 | `q` | dashboard | detach (reopen Ghostty to reattach) |
 
-**Cockpit split (single window).** `cmd+Y` puts the dashboard on the left and the
-selected ticket's claude on the right, in one window you stay in. While it's
-open, **moving the selection live-previews that ticket's claude on the right**
-(after a brief settle) — but only for tickets that already have a running
-session. Press **`Enter` to full-screen (zoom) the selected ticket's claude**
-(starting it first if needed); `` cmd+` `` (back to dashboard) or `C-b z`
-restores the split. Focus stays on the dashboard while cycling; click the right
-pane (or `C-b →`) to type into claude. The layout is fixed (dashboard always
-left), so if a pane ever ends up out of place it snaps back on the next
-toggle/preview.
+**Cockpit split (single window).** `cmd+Y` opens a split you live in: the
+dashboard pinned on the left, a ticket on the right. **`` cmd+` `` cycles the
+right pane through your tickets** (wrapping); the cursor stays on the right so
+you can just start typing. A ticket that already has a claude session shows it;
+one that doesn't shows a blank pane prompting **`cmd+Enter` to start** a session.
+`cmd+Enter` on an existing session full-screens (zooms) it; `cmd+Escape` or
+`C-b z` restores the split. Arrowing the dashboard directly (focus it with
+`C-b ←`) also previews on the right, focus staying on the left. The layout is
+fixed (dashboard always left), so a pane can't get stuck out of place — it snaps
+back on the next cycle/toggle.
 
-`cmd+Return`/`` cmd+` ``/`cmd+Y` are Ghostty keybinds that send the tmux prefix
-(`C-b`) + `n/g/y`; the matching tmux bindings live in `tmux.conf`. (`cmd+Return`
+These `cmd` chords are Ghostty keybinds that send the tmux prefix (`C-b`) +
+`n`/`g`/`c`/`y`; the matching bindings live in `tmux.conf`. (`cmd+Return`
 overrides Ghostty's default fullscreen toggle.)
 
 ## What a spawned session gets
@@ -88,11 +89,13 @@ resurrect attempts `claude --continue` to resume the conversation.
   bin/gl-setup         # store Linear key in Keychain
   bin/gl-fetch         # Linear + GitHub -> tickets.json
   bin/gl-dashboard     # the curses status page
-  bin/gl-open          # ensure worktree + claude window; swap into split or switch
-  bin/gl-preview       # live-preview a live ticket in the split (no creation)
+  bin/gl-open          # cmd+Enter: start the ticket's session (or zoom it)
+  bin/gl-preview       # dashboard-nav preview into the split (claude or blank)
+  bin/gl-cycle         # cmd+`: cycle the split's right pane to the next ticket
+  bin/gl-placeholder   # blank right-pane hint for ticketless tickets
   bin/gl-brief         # build the per-ticket markdown brief
   bin/gl-split         # toggle the cockpit split
-  bin/gl-return        # back to dashboard
+  bin/gl-return        # cmd+Escape: back to dashboard (un-zooms)
   bin/gl-start         # attach/create the tmux session + dashboard (run by arcade)
 ```
 

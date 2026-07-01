@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Blank right-pane placeholder shown when a cycled-to ticket has no claude
+# session yet. Displays a hint and idles; cmd+Enter (gl-open) starts the
+# session and replaces this pane.
+id="${1:-?}"
+c_dim=$'\033[2m'; c_b=$'\033[1m'; c_cy=$'\033[36m'; c_r=$'\033[0m'
+
+printf '\033[2J\033[H'   # clear + home
+printf '\n\n\n'
+printf '   %s%s%s\n\n' "$c_b$c_cy" "$id" "$c_r"
+printf '   %sNo claude session yet.%s\n\n' "$c_dim" "$c_r"
+printf '   %sPress %scmd+Enter%s%s to start one.%s\n' "$c_dim" "$c_b" "$c_r" "$c_dim" "$c_r"
+
+# Idle without consuming CPU; the pane just displays the hint until it is
+# replaced (gl-open kills/relays this pane when starting the session).
+while :; do sleep 86400; done

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Live-preview a ticket in the cockpit's right pane WITHOUT creating anything.
-# Called by the dashboard as the selection settles. No-ops unless the split is
-# active and the ticket already has a live claude window — cycling onto a not-
-# yet-started ticket leaves the current preview in place (press Enter to start).
+# Preview a ticket in the cockpit's right pane as the dashboard selection
+# settles (dashboard-driven). Shows the ticket's claude if a session is live,
+# else a blank "cmd+Enter to start" placeholder. Never creates a session.
+# Focus stays on the dashboard so the user can keep arrowing through the list.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gl-lib.sh
@@ -12,7 +12,8 @@ id="${1:-}"
 [ -n "$id" ] || exit 0
 [ -n "$TMUX_BIN" ] || exit 0
 
-gl_split_active || exit 0                 # only when the panel is up
-[ -n "$(gl_window_for "$id")" ] || exit 0 # only preview already-live tickets
+gl_split_active || exit 0     # only when the panel is up
 
-gl_show_in_cockpit "$id"
+gl_show_ticket "$id"
+cockpit="$(gl_cockpit_window)"
+gl_focus_dash "$cockpit"      # keep the cursor on the dashboard for more cycling

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cmd+Y: toggle the cockpit split — dashboard pinned on the left, the selected
-# ticket's claude session on the right. While the split is up, selecting a
-# different ticket (Enter / cmd+Return) swaps the right pane in place.
+# ticket's claude (or a blank "cmd+Enter to start" placeholder) on the right.
+# While the split is up, cmd+` cycles tickets; press again to close the split.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gl-lib.sh
@@ -20,4 +20,5 @@ fi
 
 id="${1:-$(cat "$GL_SELECTED" 2>/dev/null || true)}"
 if [ -z "$id" ]; then gl_log "No ticket selected."; exit 1; fi
-gl_show_in_cockpit "$id"
+gl_show_ticket "$id"
+gl_focus_right "$cockpit"     # land the cursor on the right pane

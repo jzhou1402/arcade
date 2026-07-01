@@ -268,12 +268,20 @@ def main(stdscr):
 
         h, _ = stdscr.getmaxyx()
         body_h = max(1, h - 3)
+
+        # Follow the shared selection so cmd+` / gl-cycle (which run in their own
+        # processes, not this one) move the highlight here too.
+        sel = read_selected()
+        if sel and tickets and sel != tickets[idx].get("id"):
+            for i, t in enumerate(tickets):
+                if t.get("id") == sel:
+                    idx = i
+                    break
+
         if idx < top:
             top = idx
         elif idx >= top + body_h:
             top = idx - body_h + 1
-        if tickets:
-            write_selected(tickets[idx].get("id", ""))
 
         # Fire the preview once the selection has settled (avoids thrashing the
         # join/break swap while the user holds j/k). gl-preview no-ops unless
@@ -324,6 +332,7 @@ def main(stdscr):
             subprocess.run([TMUX, "detach-client"])
 
         if moved and tickets:
+            write_selected(tickets[idx].get("id", ""))
             pending = tickets[idx].get("id", "")
             pending_ts = now
 
