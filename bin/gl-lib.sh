@@ -17,7 +17,7 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.5.0"
+GL_VERSION="0.5.1"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
@@ -72,26 +72,30 @@ gl_first_words() {
   printf '%s' "$*" | tr -s '[:space:]' ' ' | cut -d' ' -f1-"$n"
 }
 
-# Custom terminal/window title: "APP-223 three words ·#42"
+# Custom terminal/window title: "APP-223 three words ·#42". tmux rejects ':' and
+# '.' in window names (they're target-spec separators), so strip them.
 gl_title() {
   local id="$1"
-  local title pr words
+  local title pr words out
   title="$(gl_ticket_field "$id" .title)"
   pr="$(gl_ticket_field "$id" .pr.number)"
   words="$(gl_first_words 3 "$title")"
   if [ -n "$pr" ] && [ "$pr" != "null" ]; then
-    printf '%s %s ·#%s' "$id" "$words" "$pr"
+    out="$(printf '%s %s ·#%s' "$id" "$words" "$pr")"
   else
-    printf '%s %s' "$id" "$words"
+    out="$(printf '%s %s' "$id" "$words")"
   fi
+  printf '%s' "$out" | tr -d ':.'
 }
 
 # Index of the window for a ticket: matches the @ticket option, or (after a
-# resurrect restore, which drops custom options) the window-name prefix.
+# resurrect restore, which drops custom options) the window-name prefix. Never
+# matches the cockpit window — even if it carries a stray @ticket — so a ticket
+# is never mistaken as "already open" in the dashboard's own window.
 gl_window_for() {
   [ -n "$TMUX_BIN" ] || return 1
-  "$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_index}|#{@ticket}|#{window_name}' 2>/dev/null \
-    | awk -F'|' -v id="$1" '$2 == id || index($3, id " ") == 1 || $3 == id { print $1; exit }'
+  "$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_index}|#{@ticket}|#{window_name}|#{@cockpit}' 2>/dev/null \
+    | awk -F'|' -v id="$1" '$4 == "1" { next } $2 == id || index($3, id " ") == 1 || $3 == id { print $1; exit }'
 }
 
 gl_session_exists() {

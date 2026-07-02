@@ -105,6 +105,13 @@ def mark_cockpit():
                            timeout=2)
         except Exception:
             pass
+    # The cockpit is never a ticket window; clear any stray @ticket so it isn't
+    # mistaken for one (gl_window_for) or shown as a live session badge.
+    try:
+        subprocess.run([TMUX, "set-window-option", "-t", pane, "-u", "@ticket"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:
+        pass
 
 
 def fetch_blocking(stdscr):
