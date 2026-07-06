@@ -58,6 +58,8 @@ base="$(printf '%s' "$resp" | jq '
                 | select(test("github\\.com/.+/pull/[0-9]+")) ] | first // null),
       pr: null
     } ]
+  | map(select((.state // "" | ascii_downcase)
+        | IN("cancelled", "canceled", "closed", "duplicate") | not))
   | sort_by([ (if .stateType == "started" then 0 else 1 end),
               (if .priority == 0 then 5 else .priority end),
               .updatedAt ])

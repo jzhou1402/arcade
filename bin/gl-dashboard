@@ -25,13 +25,19 @@ TMUX = os.environ.get("TMUX_BIN") or "tmux"
 
 REFETCH_SECONDS = 180
 
+# Linear states never worth showing, matched by name (case-insensitive) so they
+# stay hidden regardless of how the workspace types them.
+HIDDEN_STATES = {"cancelled", "canceled", "closed", "duplicate"}
+
 
 def load_tickets():
     try:
         with open(TICKETS) as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
         return []
+    return [t for t in data
+            if (t.get("state") or "").strip().lower() not in HIDDEN_STATES]
 
 
 def load_agents():

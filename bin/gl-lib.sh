@@ -17,7 +17,7 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.6.1"
+GL_VERSION="0.6.2"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
