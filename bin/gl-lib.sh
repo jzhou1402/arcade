@@ -17,19 +17,24 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.5.1"
+GL_VERSION="0.6.0"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
 GL_BIN="$GL_CONFIG_DIR/bin"
 GL_CACHE="${GL_CACHE:-$HOME/.cache/ghostty-linear}"
 GL_TICKETS="$GL_CACHE/tickets.json"
+GL_AGENTS="$GL_CACHE/agents.json"   # registry of ad-hoc "free agent" claude windows
 GL_SELECTED="$GL_CACHE/selected"
 GL_BRIEFS="$GL_CACHE/briefs"
 
 GL_REPO="${GL_REPO:-$HOME/hazel}"
 GL_WORKTREE_BASE="${GL_WORKTREE_BASE:-$HOME/worktrees}"
 GL_BASE_BRANCH="${GL_BASE_BRANCH:-main}"
+
+# Where free agents (not tied to a ticket) run. The repo by default so claude
+# has code context; override with GL_AGENT_DIR.
+GL_AGENT_DIR="${GL_AGENT_DIR:-$GL_REPO}"
 
 GL_SESSION="${GL_SESSION:-hazel}"
 GL_DASHBOARD_WINDOW="dashboard"
@@ -66,6 +71,29 @@ gl_ticket_field() {
     "$GL_TICKETS" 2>/dev/null
 }
 
+# --- free agents: ad-hoc claude windows not tied to a ticket -----------------
+# Registry is a JSON array of {id,name} in $GL_AGENTS. Their windows carry
+# @ticket=<id> like tickets do, so preview/cycle/live-detection work unchanged;
+# gl_is_free (registry membership) is what routes creation down the no-worktree
+# path and lets the dashboard group them separately.
+
+# Ordered free-agent ids (empty if none).
+gl_agent_ids() {
+  [ -f "$GL_AGENTS" ] && jq -r '.[].id' "$GL_AGENTS" 2>/dev/null || true
+}
+
+# Display name for a free agent (falls back to the id).
+gl_agent_name() {
+  [ -f "$GL_AGENTS" ] || { printf '%s' "$1"; return; }
+  jq -r --arg id "$1" '(map(select(.id==$id))|.[0].name) // $id' "$GL_AGENTS" 2>/dev/null
+}
+
+# True when id is a registered free agent.
+gl_is_free() {
+  [ -f "$GL_AGENTS" ] || return 1
+  [ "$(jq -r --arg id "$1" 'any(.[]; .id==$id)' "$GL_AGENTS" 2>/dev/null)" = "true" ]
+}
+
 # First N words of a string.
 gl_first_words() {
   local n="$1"; shift
@@ -77,6 +105,11 @@ gl_first_words() {
 gl_title() {
   local id="$1"
   local title pr words out
+  if gl_is_free "$id"; then
+    out="$(gl_agent_name "$id")"
+    printf '%s' "$out" | tr -d ':.'
+    return
+  fi
   title="$(gl_ticket_field "$id" .title)"
   pr="$(gl_ticket_field "$id" .pr.number)"
   words="$(gl_first_words 3 "$title")"
@@ -173,6 +206,21 @@ gl_ensure_window() {
   existing="$(gl_window_for "$id")"
   if [ -n "$existing" ]; then
     "$TMUX_BIN" display-message -p -t "$GL_SESSION:$existing" '#{window_id}'
+    return 0
+  fi
+
+  # Free agents: a plain claude in GL_AGENT_DIR — no worktree, no ticket prompt.
+  if gl_is_free "$id"; then
+    claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
+    shell="${SHELL:-/bin/zsh}"
+    title="$(gl_title "$id")"
+    wt="$GL_AGENT_DIR"; [ -d "$wt" ] || wt="$HOME"
+    launch="$(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id"); exec $(printf '%q' "$shell") -l"
+    win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "$title" -c "$wt" -P -F '#{window_id}' "$launch")"
+    "$TMUX_BIN" set-window-option -t "$win" @ticket "$id" >/dev/null
+    "$TMUX_BIN" set-window-option -t "$win" automatic-rename off >/dev/null
+    "$TMUX_BIN" set-window-option -t "$win" allow-rename off >/dev/null
+    printf '%s' "$win"
     return 0
   fi
 

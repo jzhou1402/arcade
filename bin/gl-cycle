@@ -13,12 +13,15 @@ gl_split_active || exit 0
 
 cockpit="$(gl_cockpit_window)"
 
-# Ordered ticket ids from the cached list (the same order the dashboard shows).
+# Ordered ids the dashboard shows: tickets first, then free agents (same order).
 # Plain read loop (not mapfile) so this works on macOS's stock bash 3.2 too.
 ids=()
 while IFS= read -r _line; do
   [ -n "$_line" ] && ids+=("$_line")
 done < <(jq -r '.[].id' "$GL_TICKETS" 2>/dev/null)
+while IFS= read -r _line; do
+  [ -n "$_line" ] && ids+=("$_line")
+done < <(gl_agent_ids)
 [ "${#ids[@]}" -gt 0 ] || exit 0
 
 # Current = what's shown (fall back to the saved selection).

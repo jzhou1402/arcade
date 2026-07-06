@@ -31,9 +31,19 @@ worktree, briefed via the Linear + GitHub MCPs), and flip between them.
 | `cmd+Return` | anywhere | start the ticket's session if it has none; if it already has one, full-screen (zoom) it |
 | `cmd+Escape` | anywhere | jump focus back to the dashboard (also un-zooms) |
 | `Enter` | dashboard | same as cmd+Return for the highlighted ticket |
+| `a` | dashboard | **add a free agent** — spawn a new ad-hoc claude not tied to a ticket |
+| `x` | dashboard | **remove** the selected free agent (kill it + drop it from the list) |
 | `r` | dashboard | refresh tickets from Linear + GitHub now |
 | `o` | dashboard | open the selected ticket in the browser |
 | `q` | dashboard | detach (reopen Ghostty to reattach) |
+
+**Free agents.** Below the tickets, the dashboard has a **Free agents** section:
+ad-hoc `claude` windows *not* tied to any Linear ticket, for scratch work or
+one-off questions. Press `a` to spawn one (`agent-1`, `agent-2`, …), `x` to
+remove the selected one. They run in the repo (`$GL_AGENT_DIR`, default
+`$GL_REPO`) with a plain `claude` — no worktree, no ticket-seeding prompt — and
+they take part in the split just like tickets: cycle onto one with `` cmd+` ``,
+`cmd+Enter` to focus/zoom. Registered in `~/.cache/ghostty-linear/agents.json`.
 
 **Cockpit split (single window).** `cmd+Y` opens a split you live in: the
 dashboard pinned on the left, a ticket on the right. **`` cmd+` `` cycles the
@@ -90,6 +100,7 @@ resurrect attempts `claude --continue` to resume the conversation.
   bin/gl-fetch         # Linear + GitHub -> tickets.json
   bin/gl-dashboard     # the curses status page
   bin/gl-open          # cmd+Enter: start the ticket's session (or zoom it)
+  bin/gl-agent         # add/remove ad-hoc free-agent claude windows
   bin/gl-preview       # dashboard-nav preview into the split (claude or blank)
   bin/gl-cycle         # cmd+`: cycle the split's right pane to the next ticket
   bin/gl-placeholder   # blank right-pane hint for ticketless tickets
@@ -104,7 +115,8 @@ resurrect attempts `claude --continue` to resume the conversation.
 ## Tuning (env vars, override in your shell profile)
 
 - `GL_REPO` (default `~/hazel`), `GL_WORKTREE_BASE` (`~/worktrees`),
-  `GL_BASE_BRANCH` (`main`), `GL_SESSION` (`hazel`), `GL_CLAUDE` (the claude binary).
+  `GL_BASE_BRANCH` (`main`), `GL_SESSION` (`hazel`), `GL_CLAUDE` (the claude binary),
+  `GL_AGENT_DIR` (where free agents run, default `$GL_REPO`).
 
 ## Uninstall
 

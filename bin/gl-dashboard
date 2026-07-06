@@ -17,6 +17,7 @@ HOME = os.path.expanduser("~")
 CACHE = os.environ.get("GL_CACHE", os.path.join(HOME, ".cache/ghostty-linear"))
 BIN = os.path.dirname(os.path.abspath(__file__))
 TICKETS = os.path.join(CACHE, "tickets.json")
+AGENTS = os.path.join(CACHE, "agents.json")
 SELECTED = os.path.join(CACHE, "selected")
 SESSION = os.environ.get("GL_SESSION", "hazel")
 TMUX = os.environ.get("TMUX_BIN") or "tmux"
@@ -30,6 +31,35 @@ def load_tickets():
             return json.load(f)
     except (OSError, ValueError):
         return []
+
+
+def load_agents():
+    """Registered ad-hoc free agents: [{id,name}, ...]."""
+    try:
+        with open(AGENTS) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def build_items(tickets, agents):
+    """Flat navigable list: tickets first, then free agents."""
+    items = [{"kind": "ticket", "id": t.get("id", "?"), "data": t} for t in tickets]
+    items += [{"kind": "agent", "id": a.get("id", "?"), "data": a} for a in agents]
+    return items
+
+
+def build_rows(tickets, agents):
+    """Display rows, item_idx aligned to build_items():
+       ("ticket", t, i) | ("header", label) | ("agent", a, i)."""
+    rows, i = [], 0
+    for t in tickets:
+        rows.append(("ticket", t, i)); i += 1
+    rows.append(("header", "Free agents  (a add · x remove)"))
+    for a in agents:
+        rows.append(("agent", a, i)); i += 1
+    return rows
 
 
 def live_tickets():
@@ -165,11 +195,11 @@ def add_seg(stdscr, y, x, text, width, color, selected, maxw):
     return x + len(cell)
 
 
-def draw(stdscr, tickets, idx, top, live, status_line, shown=""):
+def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     title = "  Linear — my active tickets"
-    count = f"{len(tickets)} tickets · {len(live)} live  "
+    count = f"{n_tickets} tickets · {n_agents} agents · {len(live)} live  "
     stdscr.attron(curses.A_BOLD)
     stdscr.addnstr(0, 0, title.ljust(max(0, w - len(count))) + count, w - 1)
     stdscr.attroff(curses.A_BOLD)
@@ -179,17 +209,21 @@ def draw(stdscr, tickets, idx, top, live, status_line, shown=""):
     body_h = max(1, h - body_top - 1)
     maxw = w - 1
 
-    for row, t in enumerate(tickets[top:top + body_h]):
-        i = top + row
+    for row, entry in enumerate(rows[top:top + body_h]):
         y = body_top + row
-        sel = (i == idx)
-        tid = t.get("id", "?")
-        is_live = tid in live
-        state = t.get("state") or ""
-        prtext, prcolor, rtext, rcolor = pr_cells(t.get("pr"))
-        title_w = max(10, maxw - 3 - 11 - 13 - 16 - 7)
-        ttl = t.get("title") or ""
+        kind = entry[0]
 
+        if kind == "header":
+            try:
+                stdscr.attron(curses.A_DIM)
+                stdscr.addnstr(y, 0, ("── " + entry[1] + " ").ljust(maxw, "─")[:maxw], maxw)
+                stdscr.attroff(curses.A_DIM)
+            except curses.error:
+                pass
+            continue
+
+        _, obj, i = entry
+        sel = (i == idx)
         if sel:
             stdscr.attron(curses.A_REVERSE)
             try:
@@ -197,17 +231,28 @@ def draw(stdscr, tickets, idx, top, live, status_line, shown=""):
             except curses.error:
                 pass
             stdscr.attroff(curses.A_REVERSE)
-        x = 0
-        x = add_seg(stdscr, y, x, f" {'●' if is_live else ' '} ", 3, 3 if is_live else 0, sel, maxw)
-        x = add_seg(stdscr, y, x, tid, 11, 0, sel, maxw)
-        x = add_seg(stdscr, y, x, state, 13, 0, sel, maxw)
-        x = add_seg(stdscr, y, x, prtext, 16, prcolor, sel, maxw)
-        x = add_seg(stdscr, y, x, rtext, 7, rcolor, sel, maxw)
-        x = add_seg(stdscr, y, x, ttl, title_w, 0, sel, maxw)
+
+        is_live = obj.get("id", "?") in live
+        x = add_seg(stdscr, y, 0, f" {'●' if is_live else ' '} ", 3, 3 if is_live else 0, sel, maxw)
+        if kind == "ticket":
+            state = obj.get("state") or ""
+            prtext, prcolor, rtext, rcolor = pr_cells(obj.get("pr"))
+            title_w = max(10, maxw - 3 - 11 - 13 - 16 - 7)
+            x = add_seg(stdscr, y, x, obj.get("id", "?"), 11, 0, sel, maxw)
+            x = add_seg(stdscr, y, x, state, 13, 0, sel, maxw)
+            x = add_seg(stdscr, y, x, prtext, 16, prcolor, sel, maxw)
+            x = add_seg(stdscr, y, x, rtext, 7, rcolor, sel, maxw)
+            x = add_seg(stdscr, y, x, obj.get("title") or "", title_w, 0, sel, maxw)
+        else:  # agent
+            x = add_seg(stdscr, y, x, obj.get("id", "?"), 11, 0, sel, maxw)
+            name = obj.get("name") or ""
+            if name == obj.get("id"):
+                name = "claude (free agent)"
+            x = add_seg(stdscr, y, x, name, max(10, maxw - x), 0, sel, maxw)
 
     split = f" · ▶ {shown}" if shown else ""
-    footer = (" ↑/↓ move · Enter open · y split" + split +
-              " · g back · r refresh · o browser · q detach ")
+    footer = (" ↑/↓ move · ⏎ open · y split" + split +
+              " · a add · x remove · g back · r refresh · q detach ")
     try:
         stdscr.attron(curses.A_DIM)
         stdscr.addnstr(h - 1, 0, (status_line or footer)[:maxw], maxw)
@@ -238,12 +283,14 @@ def main(stdscr):
     if not tickets:
         fetch_blocking(stdscr)
         tickets = load_tickets()
+    agents = load_agents()
+    items = build_items(tickets, agents)
 
     idx = 0
     sel = read_selected()
     if sel:
-        for i, t in enumerate(tickets):
-            if t.get("id") == sel:
+        for i, it in enumerate(items):
+            if it["id"] == sel:
                 idx = i
                 break
     top = 0
@@ -253,7 +300,7 @@ def main(stdscr):
     last_mark = 0.0
     live = set()
     shown = ""
-    pending = None       # ticket id whose preview is waiting to settle
+    pending = None       # id whose preview is waiting to settle
     pending_ts = 0.0
     status_line = ""
 
@@ -267,37 +314,44 @@ def main(stdscr):
         if now - last_poll >= POLL_SECS:
             live = live_tickets()
             shown = cockpit_shown()
+            agents = load_agents()
             last_poll = now
             if now - last_fetch > REFETCH_SECONDS:
                 fetch_blocking(stdscr)
                 tickets = load_tickets()
                 last_fetch = time.time()
 
+        items = build_items(tickets, agents)
+        rows = build_rows(tickets, agents)
+        n = len(items)
+        idx = max(0, min(idx, n - 1)) if n else 0
+
         h, _ = stdscr.getmaxyx()
         body_h = max(1, h - 3)
 
-        # Follow the shared selection so cmd+` / gl-cycle (which run in their own
-        # processes, not this one) move the highlight here too.
+        # Follow the shared selection so cmd+` / gl-cycle (separate processes)
+        # move the highlight here too.
         sel = read_selected()
-        if sel and tickets and sel != tickets[idx].get("id"):
-            for i, t in enumerate(tickets):
-                if t.get("id") == sel:
+        if sel and n and (idx >= n or items[idx]["id"] != sel):
+            for i, it in enumerate(items):
+                if it["id"] == sel:
                     idx = i
                     break
 
-        if idx < top:
-            top = idx
-        elif idx >= top + body_h:
-            top = idx - body_h + 1
+        # Keep the selected item's display row on screen (rows include the
+        # non-selectable "Free agents" header).
+        sel_row = next((r for r, e in enumerate(rows) if e[0] != "header" and e[2] == idx), 0)
+        if sel_row < top:
+            top = sel_row
+        elif sel_row >= top + body_h:
+            top = sel_row - body_h + 1
+        top = max(0, min(top, max(0, len(rows) - 1)))
 
-        # Fire the preview once the selection has settled (avoids thrashing the
-        # join/break swap while the user holds j/k). gl-preview no-ops unless
-        # the split is up and the ticket is already live.
         if pending is not None and now - pending_ts >= PREVIEW_DEBOUNCE:
             run_bg([os.path.join(BIN, "gl-preview"), pending])
             pending = None
 
-        draw(stdscr, tickets, idx, top, live, status_line, shown)
+        draw(stdscr, rows, idx, top, live, status_line, shown, len(tickets), len(agents))
         status_line = ""
 
         try:
@@ -308,28 +362,40 @@ def main(stdscr):
         if c == -1:
             continue
 
+        cur = items[idx] if n else None
         moved = False
         if c in (curses.KEY_UP, ord("k")):
             idx = max(0, idx - 1); moved = True
         elif c in (curses.KEY_DOWN, ord("j")):
-            idx = min(len(tickets) - 1, idx + 1) if tickets else 0; moved = True
+            idx = min(n - 1, idx + 1) if n else 0; moved = True
         elif c == curses.KEY_NPAGE:
-            idx = min(len(tickets) - 1, idx + body_h) if tickets else 0; moved = True
+            idx = min(n - 1, idx + body_h) if n else 0; moved = True
         elif c == curses.KEY_PPAGE:
             idx = max(0, idx - body_h); moved = True
         elif c in (curses.KEY_ENTER, 10, 13):
-            if tickets:
-                run_bg([os.path.join(BIN, "gl-open"), tickets[idx]["id"]])
+            if cur:
+                run_bg([os.path.join(BIN, "gl-open"), cur["id"]])
                 pending = None
         elif c == ord("y"):
-            if tickets:
-                run_bg([os.path.join(BIN, "gl-split"), tickets[idx]["id"]])
+            if cur:
+                run_bg([os.path.join(BIN, "gl-split"), cur["id"]])
                 pending = None
+        elif c == ord("a"):
+            run_bg([os.path.join(BIN, "gl-agent"), "add"])
+            status_line = " spawning free agent… "
+            last_poll = 0.0     # reload the agent list promptly
+        elif c == ord("x"):
+            if cur and cur["kind"] == "agent":
+                run_bg([os.path.join(BIN, "gl-agent"), "remove", cur["id"]])
+                status_line = f" removed {cur['id']} "
+                last_poll = 0.0
+            else:
+                status_line = " x removes a free agent (select one) "
         elif c == ord("g"):
             run_bg([os.path.join(BIN, "gl-return")])
         elif c == ord("o"):
-            if tickets and tickets[idx].get("url"):
-                run_bg(["open", tickets[idx]["url"]])
+            if cur and cur["kind"] == "ticket" and cur["data"].get("url"):
+                run_bg(["open", cur["data"]["url"]])
         elif c == ord("r"):
             fetch_blocking(stdscr)
             tickets = load_tickets()
@@ -338,9 +404,9 @@ def main(stdscr):
         elif c == ord("q"):
             subprocess.run([TMUX, "detach-client"])
 
-        if moved and tickets:
-            write_selected(tickets[idx].get("id", ""))
-            pending = tickets[idx].get("id", "")
+        if moved and n:
+            write_selected(items[idx]["id"])
+            pending = items[idx]["id"]
             pending_ts = now
 
 

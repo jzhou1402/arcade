@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Manage ad-hoc "free agent" claude windows (not tied to a Linear ticket).
+#   gl-agent add [name]     register a new agent-N, spawn its claude window
+#   gl-agent remove [id]     kill its window + drop it from the registry
+#   gl-agent list            print agent ids (one per line)
+# Free agents live in $GL_AGENT_DIR (the repo by default) and carry
+# @ticket=<id> like tickets, so the split preview/cycle treat them the same.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+cmd="${1:-list}"; shift || true
+
+_write_registry() {  # stdin: new JSON -> atomic replace
+  local tmp; tmp="$(mktemp "${GL_CACHE}/agents.XXXXXX")"
+  cat > "$tmp" && mv "$tmp" "$GL_AGENTS"
+}
+
+case "$cmd" in
+  add)
+    name="${1:-}"
+    [ -f "$GL_AGENTS" ] || printf '[]' > "$GL_AGENTS"
+    # next free id: max existing agent-N + 1
+    max=0
+    while IFS= read -r x; do
+      n="${x#agent-}"
+      case "$n" in ''|*[!0-9]*) ;; *) [ "$n" -gt "$max" ] && max="$n" ;; esac
+    done < <(gl_agent_ids)
+    id="agent-$((max + 1))"
+    [ -n "$name" ] || name="$id"
+    jq --arg id "$id" --arg name "$name" '. + [{id:$id, name:$name}]' "$GL_AGENTS" | _write_registry
+
+    [ -n "$TMUX_BIN" ] || { printf '%s\n' "$id"; exit 0; }
+    win="$(gl_ensure_window "$id")"
+    printf '%s\n' "$id" > "$GL_SELECTED"
+    if gl_split_active; then
+      gl_show_ticket "$id"
+      gl_focus_right "$(gl_cockpit_window)"
+    else
+      "$TMUX_BIN" select-window -t "$win" >/dev/null 2>&1 || true
+    fi
+    printf '%s\n' "$id"
+    ;;
+
+  remove|rm|delete)
+    id="${1:-$(cat "$GL_SELECTED" 2>/dev/null || true)}"
+    [ -n "$id" ] || { gl_log "No agent id."; exit 1; }
+    gl_is_free "$id" || { gl_log "$id is not a free agent."; exit 1; }
+
+    cockpit="$(gl_cockpit_window || true)"
+    if [ -n "$cockpit" ] && [ "$(gl_shown_ticket "$cockpit")" = "$id" ]; then
+      # currently shown in the split: kill the joined pane, clear the slot
+      right="$(gl_cockpit_claude_pane "$cockpit")"
+      [ -n "$right" ] && "$TMUX_BIN" kill-pane -t "$right" 2>/dev/null || true
+      "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown 2>/dev/null || true
+      "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown_kind 2>/dev/null || true
+    else
+      win="$(gl_window_for "$id")"
+      [ -n "$win" ] && "$TMUX_BIN" kill-window -t "$GL_SESSION:$win" 2>/dev/null || true
+    fi
+
+    [ -f "$GL_AGENTS" ] && jq --arg id "$id" 'map(select(.id != $id))' "$GL_AGENTS" | _write_registry
+    ;;
+
+  list|ls)
+    gl_agent_ids
+    ;;
+
+  *)
+    gl_log "usage: gl-agent {add [name]|remove [id]|list}"; exit 1
+    ;;
+esac
