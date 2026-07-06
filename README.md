@@ -25,7 +25,7 @@ worktree, briefed via the Linear + GitHub MCPs), and flip between them.
 
 | Key | Where | Action |
 |-----|-------|--------|
-| `↑`/`↓` (or `j`/`k`) | dashboard | move selection (paginates the list) |
+| `↑`/`↓` (or `j`/`k`) | dashboard | move selection (tickets with a live session sort to the top) |
 | `cmd+Y` | anywhere | toggle the **cockpit split**: dashboard pinned left, selected ticket on the right. Press again to close |
 | `` cmd+` `` | split | **cycle** the right pane to the next ticket (cursor stays on the right) |
 | `cmd+Return` | anywhere | start the ticket's session if it has none; if it already has one, full-screen (zoom) it |

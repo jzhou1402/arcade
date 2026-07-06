@@ -19,6 +19,7 @@ BIN = os.path.dirname(os.path.abspath(__file__))
 TICKETS = os.path.join(CACHE, "tickets.json")
 AGENTS = os.path.join(CACHE, "agents.json")
 SELECTED = os.path.join(CACHE, "selected")
+ORDER = os.path.join(CACHE, "order")
 SESSION = os.environ.get("GL_SESSION", "hazel")
 TMUX = os.environ.get("TMUX_BIN") or "tmux"
 
@@ -41,6 +42,12 @@ def load_agents():
         return data if isinstance(data, list) else []
     except (OSError, ValueError):
         return []
+
+
+def order_tickets(tickets, live):
+    """Tickets with a live session float to the top; order is otherwise
+    preserved (stable sort)."""
+    return sorted(tickets, key=lambda t: t.get("id", "?") not in live)
 
 
 def build_items(tickets, agents):
@@ -303,6 +310,7 @@ def main(stdscr):
     pending = None       # id whose preview is waiting to settle
     pending_ts = 0.0
     status_line = ""
+    last_order = None
 
     while True:
         now = time.time()
@@ -321,10 +329,21 @@ def main(stdscr):
                 tickets = load_tickets()
                 last_fetch = time.time()
 
-        items = build_items(tickets, agents)
-        rows = build_rows(tickets, agents)
+        tickets_view = order_tickets(tickets, live)   # live sessions on top
+        items = build_items(tickets_view, agents)
+        rows = build_rows(tickets_view, agents)
         n = len(items)
         idx = max(0, min(idx, n - 1)) if n else 0
+
+        # Publish the visible order so gl-cycle (cmd+`) matches the screen.
+        order = "\n".join(it["id"] for it in items)
+        if order != last_order:
+            try:
+                with open(ORDER, "w") as f:
+                    f.write(order + ("\n" if order else ""))
+            except OSError:
+                pass
+            last_order = order
 
         h, _ = stdscr.getmaxyx()
         body_h = max(1, h - 3)

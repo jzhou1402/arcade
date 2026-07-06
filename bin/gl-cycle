@@ -13,15 +13,23 @@ gl_split_active || exit 0
 
 cockpit="$(gl_cockpit_window)"
 
-# Ordered ids the dashboard shows: tickets first, then free agents (same order).
-# Plain read loop (not mapfile) so this works on macOS's stock bash 3.2 too.
+# Cycle in the exact order the dashboard shows (live sessions on top). The
+# dashboard publishes that to $GL_ORDER; fall back to tickets.json + agents if
+# it isn't there yet. Plain read loop (not mapfile) for macOS bash 3.2.
 ids=()
-while IFS= read -r _line; do
-  [ -n "$_line" ] && ids+=("$_line")
-done < <(jq -r '.[].id' "$GL_TICKETS" 2>/dev/null)
-while IFS= read -r _line; do
-  [ -n "$_line" ] && ids+=("$_line")
-done < <(gl_agent_ids)
+if [ -f "$GL_ORDER" ]; then
+  while IFS= read -r _line; do
+    [ -n "$_line" ] && ids+=("$_line")
+  done < "$GL_ORDER"
+fi
+if [ "${#ids[@]}" -eq 0 ]; then
+  while IFS= read -r _line; do
+    [ -n "$_line" ] && ids+=("$_line")
+  done < <(jq -r '.[].id' "$GL_TICKETS" 2>/dev/null)
+  while IFS= read -r _line; do
+    [ -n "$_line" ] && ids+=("$_line")
+  done < <(gl_agent_ids)
+fi
 [ "${#ids[@]}" -gt 0 ] || exit 0
 
 # Current = what's shown (fall back to the saved selection).

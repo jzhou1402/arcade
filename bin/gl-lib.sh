@@ -17,7 +17,7 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.6.0"
+GL_VERSION="0.6.1"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
@@ -26,6 +26,7 @@ GL_CACHE="${GL_CACHE:-$HOME/.cache/ghostty-linear}"
 GL_TICKETS="$GL_CACHE/tickets.json"
 GL_AGENTS="$GL_CACHE/agents.json"   # registry of ad-hoc "free agent" claude windows
 GL_SELECTED="$GL_CACHE/selected"
+GL_ORDER="$GL_CACHE/order"          # dashboard's current visible id order (for gl-cycle)
 GL_BRIEFS="$GL_CACHE/briefs"
 
 GL_REPO="${GL_REPO:-$HOME/hazel}"
