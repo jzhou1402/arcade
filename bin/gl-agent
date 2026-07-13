@@ -48,18 +48,22 @@ case "$cmd" in
     [ -n "$id" ] || { gl_log "No agent id."; exit 1; }
     gl_is_free "$id" || { gl_log "$id is not a free agent."; exit 1; }
 
+    # 1. If it's joined into the cockpit right now, kill just that pane + clear
+    #    the slot (never kill-window the cockpit itself).
     cockpit="$(gl_cockpit_window || true)"
     if [ -n "$cockpit" ] && [ "$(gl_shown_ticket "$cockpit")" = "$id" ]; then
-      # currently shown in the split: kill the joined pane, clear the slot
       right="$(gl_cockpit_claude_pane "$cockpit")"
       [ -n "$right" ] && "$TMUX_BIN" kill-pane -t "$right" 2>/dev/null || true
       "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown 2>/dev/null || true
       "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown_kind 2>/dev/null || true
-    else
-      win="$(gl_window_for "$id")"
-      [ -n "$win" ] && "$TMUX_BIN" kill-window -t "$GL_SESSION:$win" 2>/dev/null || true
     fi
+    # 2. Kill every standalone (non-cockpit) window carrying this id — covers
+    #    duplicates and guarantees the window dies with the registry entry.
+    "$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_id}|#{@ticket}|#{@cockpit}' 2>/dev/null \
+      | awk -F'|' -v id="$id" '$3 != "1" && $2 == id { print $1 }' \
+      | while IFS= read -r w; do "$TMUX_BIN" kill-window -t "$w" 2>/dev/null || true; done
 
+    # 3. Drop it from the registry.
     [ -f "$GL_AGENTS" ] && jq --arg id "$id" 'map(select(.id != $id))' "$GL_AGENTS" | _write_registry
     ;;
 

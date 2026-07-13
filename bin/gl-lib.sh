@@ -17,7 +17,7 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.6.2"
+GL_VERSION="0.6.3"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
@@ -95,6 +95,12 @@ gl_is_free() {
   [ "$(jq -r --arg id "$1" 'any(.[]; .id==$id)' "$GL_AGENTS" 2>/dev/null)" = "true" ]
 }
 
+# True when id is a real ticket in the cache (has a branch/worktree).
+gl_is_ticket() {
+  [ -f "$GL_TICKETS" ] || return 1
+  [ "$(jq -r --arg id "$1" 'any(.[]; .id==$id)' "$GL_TICKETS" 2>/dev/null)" = "true" ]
+}
+
 # First N words of a string.
 gl_first_words() {
   local n="$1"; shift
@@ -128,8 +134,15 @@ gl_title() {
 # is never mistaken as "already open" in the dashboard's own window.
 gl_window_for() {
   [ -n "$TMUX_BIN" ] || return 1
-  "$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_index}|#{@ticket}|#{window_name}|#{@cockpit}' 2>/dev/null \
-    | awk -F'|' -v id="$1" '$4 == "1" { next } $2 == id || index($3, id " ") == 1 || $3 == id { print $1; exit }'
+  # A ticket whose claude is currently joined into the cockpit has no standalone
+  # window; match the cockpit window in that case (only when it holds a real
+  # claude, not a blank placeholder) so callers don't double-create a window.
+  "$TMUX_BIN" list-windows -t "$GL_SESSION" \
+    -F '#{window_index}|#{@ticket}|#{window_name}|#{@cockpit}|#{@shown}|#{@shown_kind}' 2>/dev/null \
+    | awk -F'|' -v id="$1" '
+        $4 == "1" { if ($5 == id && $6 == "claude") { print $1; exit } ; next }
+        $2 == id || index($3, id " ") == 1 || $3 == id { print $1; exit }
+      '
 }
 
 gl_session_exists() {
@@ -210,8 +223,10 @@ gl_ensure_window() {
     return 0
   fi
 
-  # Free agents: a plain claude in GL_AGENT_DIR — no worktree, no ticket prompt.
-  if gl_is_free "$id"; then
+  # Free agents (and any id that isn't a genuine ticket): a plain claude in
+  # GL_AGENT_DIR — no worktree, no ticket prompt. Guarding on gl_is_ticket means
+  # a stray/de-registered agent-N id can never spawn a bogus worktree.
+  if gl_is_free "$id" || ! gl_is_ticket "$id"; then
     claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
     shell="${SHELL:-/bin/zsh}"
     title="$(gl_title "$id")"
