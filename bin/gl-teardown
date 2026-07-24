@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Reap the session behind a ticket that has left the Linear active set: kill its
+# dev servers + claude session, close its tmux window, and remove its worktree.
+#
+#   gl-teardown <TICKET-ID>   reap one ticket now (must not be in tickets.json,
+#                             unless --force, so you can't reap an active one)
+#   gl-teardown --reap        reconcile the whole session against tickets.json
+#                             (same pass gl-fetch runs after a successful fetch)
+#
+# Free agents (agent-N) and anything living in the main repo are never touched.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+[ -n "$TMUX_BIN" ] || { gl_log "tmux not found."; exit 1; }
+gl_session_exists || { gl_log "No '$GL_SESSION' tmux session."; exit 1; }
+
+force=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    --force|-f) force=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]:-}"
+
+cmd="${1:-}"
+case "$cmd" in
+  --reap|reap|"")
+    gl_reap_orphans
+    ;;
+  *)
+    id="$cmd"
+    if [ "$force" != "1" ] && gl_is_ticket "$id"; then
+      gl_log "$id is still in the active set — refusing (use --force to override)."
+      exit 1
+    fi
+    gl_teardown "$id"
+    ;;
+esac

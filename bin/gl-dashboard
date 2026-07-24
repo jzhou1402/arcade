@@ -387,6 +387,25 @@ def main(stdscr):
         if c == -1:
             continue
 
+        # Paste / drag-drop guard. A real keypress arrives alone within a poll
+        # window; a paste (e.g. Ghostty pasting a dropped image's shell-escaped
+        # file path) dumps many characters at once. Drain what's already queued:
+        # if a burst follows, it's a paste/drop, so swallow the whole thing
+        # instead of running each character as a command. Without this, path
+        # characters fire destructive keys — 'a' (add agent), the 'x' in a
+        # "1920x1080" filename (remove agent), a stray 'q' (detach) — which is
+        # the "spawns agents / kills agents / crashes" bug.
+        stdscr.timeout(0)                 # non-blocking: drain the input buffer
+        burst = 0
+        while stdscr.getch() != -1:
+            burst += 1
+            if burst > 8192:              # pathologically large paste; stop draining
+                break
+        stdscr.timeout(120)               # restore the normal poll cadence
+        if burst >= 3:
+            status_line = " ignored paste/drop — focus a claude pane before dropping an image "
+            continue
+
         cur = items[idx] if n else None
         moved = False
         if c in (curses.KEY_UP, ord("k")):
