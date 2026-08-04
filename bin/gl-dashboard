@@ -79,21 +79,25 @@ def live_tickets():
     try:
         out = subprocess.run(
             [TMUX, "list-windows", "-t", SESSION, "-F",
-             "#{@ticket}|#{window_name}|#{@shown}"],
+             "#{@ticket}|#{window_name}|#{@shown}|#{@shown_kind}"],
             capture_output=True, text=True, timeout=2,
         )
         ids = set()
         for ln in out.stdout.splitlines():
-            opt, name, shown = (ln.split("|", 2) + ["", "", ""])[:3]
+            opt, name, shown, kind = (ln.split("|", 3) + ["", "", "", ""])[:4]
             if opt.strip():
                 ids.add(opt.strip())
             elif name.strip():
                 first = name.split(" ", 1)[0]
                 if TICKET_RE.match(first):
                     ids.add(first)
-            # A ticket joined into the cockpit has no standalone window, but is
-            # very much live — surface it via the cockpit's @shown option.
-            if shown.strip():
+            # A ticket whose claude is joined into the cockpit has no standalone
+            # window but is genuinely live — surface it via @shown. Only when a
+            # real session is joined (@shown_kind == "claude"): a blank preview
+            # placeholder (kind "blank") must NOT count as live, otherwise merely
+            # arrowing onto a session-less ticket badges it green and floats it
+            # to the top, churning the list out from under the cursor.
+            if shown.strip() and kind.strip() == "claude":
                 ids.add(shown.strip())
         return ids
     except Exception:
@@ -285,6 +289,15 @@ def main(stdscr):
             curses.init_pair(i, fg, -1)
         except curses.error:
             pass
+    # Mouse: single-click selects a row, double-click opens a ticket in Linear.
+    # (Terminals can't report macOS Cmd, so the gesture is double-click, not
+    # Cmd-click.) mouseinterval > 0 is required for double-click detection.
+    try:
+        curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
+                         | curses.BUTTON1_PRESSED)
+        curses.mouseinterval(250)
+    except curses.error:
+        pass
     # Short poll so cycling feels live; expensive work (tmux queries, re-marking
     # the cockpit) is throttled below so we don't spawn subprocesses 8×/sec.
     stdscr.timeout(120)
@@ -408,7 +421,25 @@ def main(stdscr):
 
         cur = items[idx] if n else None
         moved = False
-        if c in (curses.KEY_UP, ord("k")):
+        if c == curses.KEY_MOUSE:
+            try:
+                _mid, _mx, my, _mz, bstate = curses.getmouse()
+            except curses.error:
+                bstate, my = 0, -1
+            row_i = top + (my - 2)          # body rows start at screen row 2
+            if 0 <= row_i < len(rows) and rows[row_i][0] != "header":
+                item_idx = rows[row_i][2]
+                if bstate & curses.BUTTON1_DOUBLE_CLICKED:
+                    it = items[item_idx]
+                    url = it["data"].get("url") if it["kind"] == "ticket" else None
+                    if url:
+                        run_bg(["open", url])
+                        status_line = f" opening {it['id']} in Linear "
+                    else:
+                        status_line = " no Linear URL for that row "
+                else:                        # single click: select (+ preview via tail)
+                    idx = item_idx; moved = True
+        elif c in (curses.KEY_UP, ord("k")):
             idx = max(0, idx - 1); moved = True
         elif c in (curses.KEY_DOWN, ord("j")):
             idx = min(n - 1, idx + 1) if n else 0; moved = True
