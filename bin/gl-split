@@ -12,6 +12,9 @@ if [ -z "$TMUX_BIN" ]; then gl_log "tmux not found."; exit 1; fi
 cockpit="$(gl_cockpit_window || true)"
 if [ -z "$cockpit" ]; then gl_log "No cockpit window."; exit 1; fi
 
+# Serialize with the other cockpit mutators (open/cycle/preview).
+gl_lock 20 || { gl_log "cockpit busy — try again."; exit 0; }
+
 if [ -n "$(gl_shown_ticket "$cockpit")" ]; then
   # Already split -> collapse back to the full-screen dashboard.
   gl_collapse_cockpit

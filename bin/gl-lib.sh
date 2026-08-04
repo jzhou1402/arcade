@@ -46,6 +46,55 @@ GL_KEYCHAIN_SERVICE="ghostty-linear-token"
 
 mkdir -p "$GL_CACHE" "$GL_BRIEFS" "$GL_WORKTREE_BASE" 2>/dev/null || true
 
+GL_LOCKDIR="$GL_CACHE/cockpit.lock.d"
+
+# --- cockpit mutation mutex ---------------------------------------------------
+# The cockpit's panes are mutated by several independent processes (gl-preview
+# on navigation, gl-open, gl-split, gl-cycle). Without serialization, a slow
+# gl_ensure_window (worktree + claude launch) in one leaves a gap where another
+# adds a pane — producing a stray third column between the dashboard and the
+# content pane. macOS has no flock, so use an atomic mkdir mutex with pid-based
+# stale detection (a crashed holder's lock is stolen, never a live one's).
+_gl_lock_take() {
+  if mkdir "$GL_LOCKDIR" 2>/dev/null; then
+    printf '%s' "$$" > "$GL_LOCKDIR/pid" 2>/dev/null || true
+    trap 'gl_unlock' EXIT INT TERM
+    return 0
+  fi
+  local holder
+  holder="$(cat "$GL_LOCKDIR/pid" 2>/dev/null || true)"
+  if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+    rm -rf "$GL_LOCKDIR" 2>/dev/null || true
+    if mkdir "$GL_LOCKDIR" 2>/dev/null; then
+      printf '%s' "$$" > "$GL_LOCKDIR/pid" 2>/dev/null || true
+      trap 'gl_unlock' EXIT INT TERM
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Release the lock only if we own it (pid matches), so a slow process finishing
+# late can never drop the lock a newer holder has since taken.
+gl_unlock() {
+  [ "$(cat "$GL_LOCKDIR/pid" 2>/dev/null || true)" = "$$" ] && rm -rf "$GL_LOCKDIR" 2>/dev/null || true
+}
+
+# Non-blocking acquire: 0 if taken, 1 if busy. For best-effort callers (preview).
+gl_trylock() { _gl_lock_take; }
+
+# Blocking acquire up to N seconds (default 20): 0 on success, 1 on timeout.
+gl_lock() {
+  local timeout="${1:-20}" i=0 max
+  max=$((timeout * 10))
+  while ! _gl_lock_take; do
+    sleep 0.1
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] && return 1
+  done
+  return 0
+}
+
 # Linear personal API key, resolved from the macOS Keychain (falls back to env).
 gl_token() {
   if [ -n "${LINEAR_API_KEY:-}" ]; then
@@ -99,6 +148,33 @@ gl_is_free() {
 gl_is_ticket() {
   [ -f "$GL_TICKETS" ] || return 1
   [ "$(jq -r --arg id "$1" 'any(.[]; .id==$id)' "$GL_TICKETS" 2>/dev/null)" = "true" ]
+}
+
+# The id the dashboard selection lands on after $1 is removed, mirroring the
+# dashboard's own clamp: the item after $1 in the visible order, else the item
+# before it, else empty (nothing left). Order comes from $GL_ORDER (what the
+# dashboard publishes), falling back to tickets + agents.
+gl_next_after() {
+  local cur="$1" line pos i
+  local ids=()
+  if [ -f "$GL_ORDER" ]; then
+    while IFS= read -r line; do [ -n "$line" ] && ids+=("$line"); done < "$GL_ORDER"
+  fi
+  if [ "${#ids[@]}" -eq 0 ]; then
+    while IFS= read -r line; do [ -n "$line" ] && ids+=("$line"); done < <(jq -r '.[].id' "$GL_TICKETS" 2>/dev/null)
+    while IFS= read -r line; do [ -n "$line" ] && ids+=("$line"); done < <(gl_agent_ids)
+  fi
+  pos=-1
+  for i in "${!ids[@]}"; do [ "${ids[$i]}" = "$cur" ] && { pos="$i"; break; }; done
+  if [ "$pos" -lt 0 ]; then
+    printf '%s' "${ids[0]:-}"                     # cur not listed: fall to first
+  elif [ $(( pos + 1 )) -lt "${#ids[@]}" ]; then
+    printf '%s' "${ids[$(( pos + 1 ))]}"          # the item after cur
+  elif [ "$pos" -gt 0 ]; then
+    printf '%s' "${ids[$(( pos - 1 ))]}"          # cur was last: the item before
+  else
+    printf ''                                     # cur was the only item
+  fi
 }
 
 # First N words of a string.
@@ -353,9 +429,13 @@ gl_show_claude() {
     return 0                                   # already showing this claude
   fi
 
-  gl_clear_right "$cockpit"
+  # Build/find the ticket's window FIRST (gl_ensure_window can be slow: worktree
+  # + claude launch). Only then disturb the cockpit, so the right pane is
+  # cleared and the new one joined back-to-back — no gap for a racing mutator to
+  # slip a third pane into.
   winid="$(gl_ensure_window "$id")"
   srcpane="$("$TMUX_BIN" list-panes -t "$winid" -F '#{pane_id}' | head -1)"
+  gl_clear_right "$cockpit"
   dash="$(_gl_cockpit_dash "$cockpit")" || { gl_log "Cockpit has no dashboard pane."; return 1; }
   "$TMUX_BIN" join-pane -h -l '55%' -s "$srcpane" -t "$dash"
   "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown "$id" >/dev/null

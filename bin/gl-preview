@@ -14,6 +14,10 @@ id="${1:-}"
 
 gl_split_active || exit 0     # only when the panel is up
 
+# Best-effort: if a real cockpit mutation (open/split/cycle) is in progress,
+# skip this preview rather than racing it into a stray third pane.
+gl_trylock || exit 0
+
 gl_show_ticket "$id"
 cockpit="$(gl_cockpit_window)"
 gl_focus_dash "$cockpit"      # keep the cursor on the dashboard for more cycling
