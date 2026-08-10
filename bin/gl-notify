@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Claude Code "Stop" hook handler for arcade sessions: when a ticket/agent
+# session finishes a turn, fire a macOS notification and mark it "unread" (a
+# marker the dashboard turns into a blue dot). No-op for non-arcade claude
+# sessions and when the user is already looking at that session's pane.
+#
+# Which session fired is taken from $GL_TICKET (exported at launch); if absent,
+# from the hook's JSON stdin `cwd` when it's a ticket worktree.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+payload="$(cat 2>/dev/null || true)"      # hook JSON on stdin
+
+id="${GL_TICKET:-}"
+if [ -z "$id" ]; then
+  cwd="$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null || true)"
+  case "$cwd" in
+    "$GL_WORKTREE_BASE"/*) id="$(basename "$cwd" | tr '[:lower:]' '[:upper:]')" ;;
+  esac
+fi
+[ -n "$id" ] || exit 0                      # not an arcade session
+gl_session_exists || exit 0
+
+# Don't nag if the user is currently looking at this session's pane. Inspect the
+# attached session's active window/pane.
+watching=0
+info="$("$TMUX_BIN" display-message -p -t "$GL_SESSION" \
+  '#{@ticket}|#{@cockpit}|#{@shown}|#{@shown_kind}|#{pane_id}|#{@dashpane}' 2>/dev/null || true)"
+IFS='|' read -r a_ticket a_cockpit a_shown a_kind a_pane a_dash <<< "$info"
+if [ "$a_cockpit" = "1" ]; then
+  [ "$a_shown" = "$id" ] && [ "$a_kind" = "claude" ] && [ -n "$a_pane" ] && [ "$a_pane" != "$a_dash" ] && watching=1
+else
+  [ "$a_ticket" = "$id" ] && watching=1
+fi
+[ "$watching" = "1" ] && exit 0
+
+# Notify (macOS). Sanitize the title for AppleScript string literals.
+ntitle="$(gl_title "$id" 2>/dev/null || printf '%s' "$id")"
+ntitle="$(printf '%s' "$ntitle" | tr -d '"\\')"
+osascript -e "display notification \"Claude finished\" with title \"${ntitle:-$id}\" sound name \"Tink\"" >/dev/null 2>&1 || true
+
+# Mark unread (dashboard shows a blue dot until the item is opened).
+mkdir -p "$GL_CACHE/unread" 2>/dev/null || true
+: > "$GL_CACHE/unread/$id" 2>/dev/null || true
+exit 0

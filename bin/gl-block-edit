@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Open a Claude authoring session for a dashboard block in the cockpit's right
+# pane. Takes a grid slot index (0-3): edits the block already there, or creates
+# a new one if the slot is empty, then seeds Claude with the block-authoring
+# contract so you can describe what you want and iterate until it works.
+#
+# NOTE: the authoring prompt is inlined (personal tool; could live in Langfuse
+# internal/<name>). A block's generator is arbitrary code Claude wrote that then
+# runs on a timer — review what it writes before trusting it.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+[ -n "$TMUX_BIN" ] || { gl_log "tmux not found"; exit 1; }
+
+slot="${1:-}"
+case "$slot" in 0|1|2|3) ;; *) gl_log "gl-block-edit: slot must be 0-3"; exit 1;; esac
+
+mkdir -p "$GL_BLOCKS"
+[ -f "$GL_BLOCKS_REGISTRY" ] || printf '{"slots":[null,null,null,null]}\n' > "$GL_BLOCKS_REGISTRY"
+
+id="$(jq -r --argjson i "$slot" '.slots[$i] // ""' "$GL_BLOCKS_REGISTRY" 2>/dev/null || true)"
+
+if [ -z "$id" ] || [ "$id" = "null" ]; then
+  n=1; while [ -d "$GL_BLOCKS/block$n" ]; do n=$((n + 1)); done
+  id="block$n"; bdir="$GL_BLOCKS/$id"; mkdir -p "$bdir"
+  cat > "$bdir/spec.json" <<JSON
+{"id":"$id","title":"New block","cadence":"daily","mode":"","instruction":"","status":"configuring"}
+JSON
+  cat > "$bdir/generator" <<'GEN'
+#!/usr/bin/env bash
+# scaffold — the configure session replaces this
+printf '%s' '{"title":"New block","mode":"","elements":[{"type":"text","text":"Not configured yet. Describe what you want in the chat on the right and I will build this block."}]}'
+GEN
+  chmod +x "$bdir/generator"
+  tmp="$(mktemp)"; jq --argjson i "$slot" --arg id "$id" '.slots[$i]=$id' "$GL_BLOCKS_REGISTRY" > "$tmp" && mv "$tmp" "$GL_BLOCKS_REGISTRY"
+  "$DIR/gl-block" "$id" --force >/dev/null 2>&1 || true   # show the scaffold immediately
+else
+  bdir="$GL_BLOCKS/$id"
+fi
+
+# Mark it as being configured so the background sweep leaves it alone.
+tmp="$(mktemp)"; jq '.status="configuring"' "$bdir/spec.json" > "$tmp" 2>/dev/null && mv "$tmp" "$bdir/spec.json" || rm -f "$tmp"
+
+instruction="$(jq -r '.instruction // ""' "$bdir/spec.json" 2>/dev/null || true)"
+claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
+
+read -r -d '' SEED <<EOF || true
+You are configuring a "block" for my ghostty-linear arcade dashboard. You are running inside this block's directory (block id: ${id}). The dashboard shows blocks in a 2x2 grid; this one occupies a quarter-screen card, so keep rendered text compact.
+
+A block is an executable \`generator\` that PRINTS a JSON render payload to stdout:
+  {"title":"<card title>","mode":"compiler|interpreter","elements":[ <element>, ... ]}
+Element types the dashboard can render:
+  {"type":"text","text":"…"}
+  {"type":"section","label":"…","text":"…"}
+  {"type":"metric","label":"…","value":"…","sub":"…"}
+  {"type":"kv","pairs":[["k","v"], …]}
+  {"type":"list","items":["…", …]}
+  {"type":"quote","text":"…","cite":"…"}
+
+Do this:
+1. Ask me what I want this block to show, unless it's already clear from: "${instruction:-(nothing specified yet)}".
+2. Choose an approach and note it as "mode":
+   - COMPILER: the generator computes/fetches directly (curl an API, run a command). Cheap, runs every refresh — prefer for live data (weather, counts, calendars).
+   - INTERPRETER: the generator shells out to \`claude -p "<instruction>"\` and reasons each refresh. Use for open-ended/LLM tasks.
+3. Write the executable at ./generator (chmod +x). It must print ONLY the JSON payload to stdout. Keep secrets/creds explicit and read-only where possible.
+4. Test by running:  ../../bin/gl-block ${id} --force   then read ./output.json — iterate until its "status" is "ready" and the content looks right in ~10 short lines.
+5. Update ./spec.json: set "title", "cadence" (daily | hourly | <N>m | <N>h), "mode", "instruction" (my ask), and finally "status":"active".
+
+When status is "active" and output.json is ready, the dashboard picks it up automatically (within ~30s). Then tell me it's live. Start by greeting me and asking what I want (or confirming the existing instruction).
+EOF
+
+launch="$(printf '%q ' "$claude_bin") --dangerously-skip-permissions $(printf '%q' "$SEED"); exec $(printf '%q' "${SHELL:-/bin/zsh}") -l"
+win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "edit $id" -c "$bdir" -P -F '#{window_id}' "$launch")"
+
+# Join the authoring session into the cockpit's right pane (serialized).
+gl_lock 15 || true
+cockpit="$(gl_cockpit_window || true)"
+if [ -n "$cockpit" ]; then
+  gl_clear_right "$cockpit"
+  srcpane="$("$TMUX_BIN" list-panes -t "$win" -F '#{pane_id}' | head -1)"
+  dash="$(_gl_cockpit_dash "$cockpit")" || dash=""
+  if [ -n "$dash" ]; then
+    "$TMUX_BIN" join-pane -h -l '55%' -s "$srcpane" -t "$dash"
+    "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown "$id" >/dev/null 2>&1 || true
+    "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown_kind claude >/dev/null 2>&1 || true
+    "$TMUX_BIN" select-window -t "$GL_SESSION:$cockpit" >/dev/null 2>&1 || true
+    p="$("$TMUX_BIN" list-panes -t "$GL_SESSION:$cockpit" -F '#{pane_id}' | grep -vx "$dash" | head -1 || true)"
+    [ -n "$p" ] && "$TMUX_BIN" select-pane -t "$p" 2>/dev/null || true
+  fi
+else
+  "$TMUX_BIN" select-window -t "$win" >/dev/null 2>&1 || true
+fi

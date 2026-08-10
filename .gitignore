@@ -9,3 +9,8 @@ __pycache__/
 # any stray local cache/state if someone points GL_CACHE here.
 /cache/
 *.local
+
+# generated block output (definitions/generators are tracked; output is not)
+blocks/*/output.json
+blocks/*/history
+blocks/*/.lock.d/

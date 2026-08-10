@@ -28,6 +28,8 @@ GL_AGENTS="$GL_CACHE/agents.json"   # registry of ad-hoc "free agent" claude win
 GL_SELECTED="$GL_CACHE/selected"
 GL_ORDER="$GL_CACHE/order"          # dashboard's current visible id order (for gl-cycle)
 GL_BRIEFS="$GL_CACHE/briefs"
+GL_BLOCKS="$GL_CONFIG_DIR/blocks"            # user-authored dashboard blocks
+GL_BLOCKS_REGISTRY="$GL_CONFIG_DIR/blocks.json"  # 2x2 grid slot assignment
 
 GL_REPO="${GL_REPO:-$HOME/hazel}"
 GL_WORKTREE_BASE="${GL_WORKTREE_BASE:-$HOME/worktrees}"
@@ -307,7 +309,7 @@ gl_ensure_window() {
     shell="${SHELL:-/bin/zsh}"
     title="$(gl_title "$id")"
     wt="$GL_AGENT_DIR"; [ -d "$wt" ] || wt="$HOME"
-    launch="$(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id"); exec $(printf '%q' "$shell") -l"
+    launch="GL_TICKET=$(printf '%q' "$id") $(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id"); exec $(printf '%q' "$shell") -l"
     win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "$title" -c "$wt" -P -F '#{window_id}' "$launch")"
     "$TMUX_BIN" set-window-option -t "$win" @ticket "$id" >/dev/null
     "$TMUX_BIN" set-window-option -t "$win" automatic-rename off >/dev/null
@@ -353,7 +355,7 @@ gl_ensure_window() {
 3. A quick local orientation brief is cached at ${brief} if you want a fast overview before the MCP calls.
 Then give me a concise summary of the task and its current state (Linear status + PR/CI/review status) and propose a short plan BEFORE changing any code. If node_modules is missing in this worktree, run pnpm install first."
 
-  launch="$(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id") $(printf '%q' "$prompt"); exec $(printf '%q' "$shell") -l"
+  launch="GL_TICKET=$(printf '%q' "$id") $(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id") $(printf '%q' "$prompt"); exec $(printf '%q' "$shell") -l"
 
   win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "$title" -c "$wt" -P -F '#{window_id}' "$launch")"
   "$TMUX_BIN" set-window-option -t "$win" @ticket "$id" >/dev/null
