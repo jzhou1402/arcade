@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Generic block runner. A "block" is a directory under $GL_CONFIG_DIR/blocks/<id>/
+# containing:
+#   spec.json   {id,title,cadence,mode,instruction,status}
+#   generator*  an executable that PRINTS a JSON object {title,mode,elements:[…]}
+#   output.json the cached render payload the dashboard draws (this script owns it)
+#
+# This script owns the lifecycle so generators stay trivial ("just print JSON"):
+# freshness per the block's cadence, single-flight lock, a "generating" marker,
+# and wrapping the generator's stdout with status/date/generatedAt.
+#
+#   gl-block <id>            run if stale (per cadence)
+#   gl-block <id> --force    run regardless of freshness
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+id="${1:-}"; [ -n "$id" ] || { gl_log "gl-block: no id"; exit 1; }
+force=0; [ "${2:-}" = "--force" ] && force=1
+
+BDIR="$GL_BLOCKS/$id"
+GEN="$BDIR/generator"
+SPEC="$BDIR/spec.json"
+OUT="$BDIR/output.json"
+LOCK="$BDIR/.lock.d"
+[ -d "$BDIR" ] || { gl_log "gl-block: no block '$id'"; exit 1; }
+[ -x "$GEN" ] || { gl_log "gl-block: $id has no executable generator"; exit 1; }
+
+cadence="$(jq -r '.cadence // "daily"' "$SPEC" 2>/dev/null || echo daily)"
+now="$(date +%s)"
+today="$(date +%Y-%m-%d)"
+
+# Leave a block being authored alone unless explicitly forced (the configure
+# session drives it with --force); the background sweep must not fight it.
+if [ "$force" != "1" ] && [ "$(jq -r '.status // ""' "$SPEC" 2>/dev/null)" = "configuring" ]; then
+  exit 0
+fi
+
+# Is the current output fresh enough to skip? (only when it's a good, ready run)
+fresh=0
+if [ "$force" != "1" ] && [ -f "$OUT" ] \
+   && [ "$(jq -r '.status // ""' "$OUT" 2>/dev/null)" = "ready" ]; then
+  case "$cadence" in
+    daily)   [ "$(jq -r '.date // ""' "$OUT" 2>/dev/null)" = "$today" ] && fresh=1 ;;
+    hourly)  age=$(( now - $(jq -r '.epoch // 0' "$OUT" 2>/dev/null) )); [ "$age" -lt 3600 ] && fresh=1 ;;
+    *m)      n="${cadence%m}"; case "$n" in ''|*[!0-9]*) n=15;; esac
+             age=$(( now - $(jq -r '.epoch // 0' "$OUT" 2>/dev/null) )); [ "$age" -lt $(( n * 60 )) ] && fresh=1 ;;
+    *h)      n="${cadence%h}"; case "$n" in ''|*[!0-9]*) n=1;; esac
+             age=$(( now - $(jq -r '.epoch // 0' "$OUT" 2>/dev/null) )); [ "$age" -lt $(( n * 3600 )) ] && fresh=1 ;;
+    always|ondemand) fresh=0 ;;
+    *)       [ "$(jq -r '.date // ""' "$OUT" 2>/dev/null)" = "$today" ] && fresh=1 ;;
+  esac
+fi
+[ "$fresh" = "1" ] && exit 0
+
+# Single-flight. Steal a lock older than 20 min (a hung/killed prior run).
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then
+    rmdir "$LOCK" 2>/dev/null || true; mkdir "$LOCK" 2>/dev/null || exit 0
+  else
+    exit 0
+  fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
+title="$(jq -r '.title // ""' "$SPEC" 2>/dev/null || true)"
+# Mark generating (keep the known title so the card shows it while it churns).
+jq -n --arg d "$today" --arg t "$title" '{date:$d, status:"generating", title:$t}' > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+
+content="$(cd "$BDIR" && GL_BLOCK_ID="$id" GL_BLOCK_DIR="$BDIR" ./generator 2>/dev/null || true)"
+
+# The generator prints its render payload; extract the JSON object defensively.
+payload="$(printf '%s' "$content" | python3 -c '
+import sys, json
+s = sys.stdin.read()
+i, j = s.find("{"), s.rfind("}")
+if i >= 0 and j > i:
+    try:
+        print(json.dumps(json.loads(s[i:j+1])))
+    except Exception:
+        pass
+' 2>/dev/null || true)"
+
+if [ -n "$payload" ] && printf '%s' "$payload" | jq -e '(.title != null) and (.elements | type == "array")' >/dev/null 2>&1; then
+  printf '%s' "$payload" | jq \
+    --arg d "$today" --argjson e "$now" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + {status:"ready", date:$d, epoch:$e, generatedAt:$ts}' > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+  gl_log "block $id: refreshed"
+else
+  jq -n --arg d "$today" --argjson e "$now" --arg t "$title" \
+    '{date:$d, epoch:$e, status:"error", title:$t, error:"generator produced no valid payload"}' \
+    > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+  gl_log "block $id: generation failed"
+fi

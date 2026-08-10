@@ -34,6 +34,7 @@ case "$cmd" in
     [ -n "$TMUX_BIN" ] || { printf '%s\n' "$id"; exit 0; }
     win="$(gl_ensure_window "$id")"
     printf '%s\n' "$id" > "$GL_SELECTED"
+    gl_lock 15 || true                 # serialize the cockpit change with peers
     if gl_split_active; then
       gl_show_ticket "$id"
       gl_focus_right "$(gl_cockpit_window)"
@@ -48,10 +49,23 @@ case "$cmd" in
     [ -n "$id" ] || { gl_log "No agent id."; exit 1; }
     gl_is_free "$id" || { gl_log "$id is not a free agent."; exit 1; }
 
+    cockpit="$(gl_cockpit_window || true)"
+    was_shown=0
+    if [ -n "$cockpit" ] && [ "$(gl_shown_ticket "$cockpit")" = "$id" ]; then
+      was_shown=1
+    fi
+
+    # If this agent is the one on display, decide where the split falls through
+    # to NOW — before we drop it from the order — so the cursor and the right
+    # pane land on the same next item.
+    next=""
+    [ "$was_shown" = "1" ] && next="$(gl_next_after "$id")"
+
+    gl_lock 15 || true                 # serialize the cockpit changes with peers
+
     # 1. If it's joined into the cockpit right now, kill just that pane + clear
     #    the slot (never kill-window the cockpit itself).
-    cockpit="$(gl_cockpit_window || true)"
-    if [ -n "$cockpit" ] && [ "$(gl_shown_ticket "$cockpit")" = "$id" ]; then
+    if [ "$was_shown" = "1" ]; then
       right="$(gl_cockpit_claude_pane "$cockpit")"
       [ -n "$right" ] && "$TMUX_BIN" kill-pane -t "$right" 2>/dev/null || true
       "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown 2>/dev/null || true
@@ -65,6 +79,15 @@ case "$cmd" in
 
     # 3. Drop it from the registry.
     [ -f "$GL_AGENTS" ] && jq --arg id "$id" 'map(select(.id != $id))' "$GL_AGENTS" | _write_registry
+
+    # 4. Keep the split alive: hand the right pane to the next item so the user
+    #    isn't dropped to a bare dashboard and forced to re-navigate. Writing
+    #    $GL_SELECTED moves the dashboard highlight to the same item.
+    if [ "$was_shown" = "1" ] && [ -n "$next" ]; then
+      printf '%s\n' "$next" > "$GL_SELECTED"
+      gl_show_ticket "$next"
+      gl_focus_dash "$cockpit"         # keep the cursor on the dashboard list
+    fi
     ;;
 
   list|ls)

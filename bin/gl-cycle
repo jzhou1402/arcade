@@ -13,6 +13,9 @@ gl_split_active || exit 0
 
 cockpit="$(gl_cockpit_window)"
 
+# Serialize with the other cockpit mutators (open/split/preview).
+gl_lock 20 || exit 0
+
 # Cycle in the exact order the dashboard shows (live sessions on top). The
 # dashboard publishes that to $GL_ORDER; fall back to tickets.json + agents if
 # it isn't there yet. Plain read loop (not mapfile) for macOS bash 3.2.

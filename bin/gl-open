@@ -13,6 +13,12 @@ id="${1:-$(cat "$GL_SELECTED" 2>/dev/null || true)}"
 if [ -z "$id" ]; then gl_log "No ticket selected."; exit 1; fi
 if [ -z "$TMUX_BIN" ]; then gl_log "tmux not found."; exit 1; fi
 
+rm -f "$GL_CACHE/unread/$id" 2>/dev/null || true   # opening a session marks it read
+
+# Serialize cockpit mutations so a concurrent preview/cycle can't add a stray
+# third pane while this open is mid-flight (gl_ensure_window can take seconds).
+gl_lock 30 || { gl_log "cockpit busy — try again."; exit 0; }
+
 if gl_split_active; then
   cockpit="$(gl_cockpit_window)"
   # Was there already a session? (a standalone window, or the one shown now)

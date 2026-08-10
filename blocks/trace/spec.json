@@ -1,0 +1,8 @@
+{
+  "id": "trace",
+  "title": "Langfuse Trace of the Day",
+  "cadence": "daily",
+  "mode": "interpreter",
+  "instruction": "Pick the most instructive recent real user interaction from Langfuse and write it up with a verbatim quote and explanation.",
+  "status": "active"
+}

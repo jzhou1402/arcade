@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import textwrap
 import time
 
 TICKET_RE = re.compile(r"^[A-Za-z]+-\d+$")
@@ -20,6 +21,10 @@ TICKETS = os.path.join(CACHE, "tickets.json")
 AGENTS = os.path.join(CACHE, "agents.json")
 SELECTED = os.path.join(CACHE, "selected")
 ORDER = os.path.join(CACHE, "order")
+UNREAD_DIR = os.path.join(CACHE, "unread")             # one file per unread id
+CONFIG_DIR = os.path.dirname(BIN)                       # …/ghostty-linear
+BLOCKS_DIR = os.path.join(CONFIG_DIR, "blocks")         # user-authored blocks
+BLOCKS_REGISTRY = os.path.join(CONFIG_DIR, "blocks.json")
 SESSION = os.environ.get("GL_SESSION", "hazel")
 TMUX = os.environ.get("TMUX_BIN") or "tmux"
 
@@ -79,21 +84,25 @@ def live_tickets():
     try:
         out = subprocess.run(
             [TMUX, "list-windows", "-t", SESSION, "-F",
-             "#{@ticket}|#{window_name}|#{@shown}"],
+             "#{@ticket}|#{window_name}|#{@shown}|#{@shown_kind}"],
             capture_output=True, text=True, timeout=2,
         )
         ids = set()
         for ln in out.stdout.splitlines():
-            opt, name, shown = (ln.split("|", 2) + ["", "", ""])[:3]
+            opt, name, shown, kind = (ln.split("|", 3) + ["", "", "", ""])[:4]
             if opt.strip():
                 ids.add(opt.strip())
             elif name.strip():
                 first = name.split(" ", 1)[0]
                 if TICKET_RE.match(first):
                     ids.add(first)
-            # A ticket joined into the cockpit has no standalone window, but is
-            # very much live — surface it via the cockpit's @shown option.
-            if shown.strip():
+            # A ticket whose claude is joined into the cockpit has no standalone
+            # window but is genuinely live — surface it via @shown. Only when a
+            # real session is joined (@shown_kind == "claude"): a blank preview
+            # placeholder (kind "blank") must NOT count as live, otherwise merely
+            # arrowing onto a session-less ticket badges it green and floats it
+            # to the top, churning the list out from under the cursor.
+            if shown.strip() and kind.strip() == "claude":
                 ids.add(shown.strip())
         return ids
     except Exception:
@@ -110,6 +119,23 @@ def cockpit_shown():
         for ln in out.stdout.splitlines():
             if ln.strip():
                 return ln.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def cockpit_right_pane():
+    """The cockpit's content pane (the one that isn't this dashboard), or "" if
+    the split isn't up. list-panes -t <our pane> scopes to the cockpit window."""
+    dash = os.environ.get("TMUX_PANE", "")
+    try:
+        out = subprocess.run(
+            [TMUX, "list-panes", "-t", dash, "-F", "#{pane_id}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        for p in out.stdout.split():
+            if p and p != dash:
+                return p
     except Exception:
         pass
     return ""
@@ -208,21 +234,196 @@ def add_seg(stdscr, y, x, text, width, color, selected, maxw):
     return x + len(cell)
 
 
-def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents):
+# --- daily info cards (below the ticket list) --------------------------------
+
+def today_str():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def load_registry():
+    """The 2x2 grid slots: exactly 4 entries, each a block id or None."""
+    try:
+        with open(BLOCKS_REGISTRY) as f:
+            slots = (json.load(f) or {}).get("slots") or []
+    except (OSError, ValueError):
+        slots = []
+    slots = [(s or None) for s in slots][:4]
+    return slots + [None] * (4 - len(slots))
+
+
+def load_block_output(bid):
+    """A block's cached render payload ($BLOCKS_DIR/<id>/output.json); None if absent."""
+    try:
+        with open(os.path.join(BLOCKS_DIR, bid, "output.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def load_block_spec(bid):
+    try:
+        with open(os.path.join(BLOCKS_DIR, bid, "spec.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def load_unread():
+    """Ids with a finished-but-unopened session (one marker file each)."""
+    try:
+        return set(os.listdir(UNREAD_DIR))
+    except OSError:
+        return set()
+
+
+def wrap_text(text, width):
+    """Word-wrap into lines, keeping blank-line paragraph breaks."""
+    width = max(4, width)
+    out = []
+    for para in (text or "").split("\n"):
+        para = para.rstrip()
+        out.extend(textwrap.wrap(para, width) if para else [""])
+    return out
+
+
+def compute_layout(h, n_rows):
+    """(body_top, list_h, cards_h). The cards fill the space beneath a short
+    list when the terminal is tall enough; otherwise it's list-only."""
+    body_top = 2
+    body_h = max(1, h - body_top - 1)          # rows body_top..h-2 (footer at h-1)
+    if body_h < 18:
+        return body_top, body_h, 0
+    cards_min = 12
+    list_h = max(3, min(n_rows, body_h - cards_min))
+    return body_top, list_h, body_h - list_h
+
+
+# The render contract: a block's output.json is {title, elements:[…]} where each
+# element is one of a small set of typed shapes. One renderer draws them all, so
+# any user-authored block renders with no dashboard changes.
+
+def element_lines(el, width):
+    t = el.get("type")
+    if t == "section":
+        return wrap_text(f'{el.get("label", "")} — {el.get("text", "")}', width)
+    if t == "metric":
+        head = ((f'{el.get("label")}: ' if el.get("label") else "")
+                + str(el.get("value", ""))
+                + (f'  ({el.get("sub")})' if el.get("sub") else ""))
+        return wrap_text(head, width)
+    if t == "kv":
+        out = []
+        for pair in (el.get("pairs") or []):
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                out.extend(wrap_text(f"{pair[0]}: {pair[1]}", width))
+        return out
+    if t == "list":
+        out = []
+        for it in (el.get("items") or []):
+            out.extend(wrap_text("• " + str(it), width))
+        return out
+    if t == "quote":
+        out = wrap_text("“" + el.get("text", "") + "”", width)
+        if el.get("cite"):
+            out.append("— " + str(el["cite"]))
+        return out
+    return wrap_text(el.get("text", ""), width)          # "text" and unknown
+
+
+def block_body_lines(o, width):
+    if not o or o.get("status") == "generating":
+        return ["composing…"]
+    if o.get("status") == "error":
+        return ["(couldn't refresh — will retry)"]
+    lines = []
+    for el in (o.get("elements") or []):
+        if lines:
+            lines.append("")                              # blank between elements
+        lines.extend(element_lines(el, width))
+    return lines or ["(empty)"]
+
+
+def draw_card(stdscr, top, x0, height, cw, heading, lines, accent, editable=True):
+    """Draw one grid cell: a heading rule (with an ✎ edit affordance in the
+    top-right corner) and word-wrapped body, clipped to the cell."""
+    if height < 2 or cw < 8:
+        return
+    inner = cw - 1                                        # gutter between columns
+    edit = " [edit]" if editable else ""                 # ASCII so every font shows it
+    rule = ("── " + heading + " ").ljust(max(0, inner - len(edit)), "─")[:max(0, inner - len(edit))] + edit
+    attr = curses.A_BOLD | (curses.color_pair(accent) if accent else 0)
+    try:
+        stdscr.attron(attr)
+        stdscr.addnstr(top, x0, rule, inner)
+        stdscr.attroff(attr)
+    except curses.error:
+        pass
+    avail = height - 1
+    show = lines[:avail]
+    if len(lines) > avail and avail > 0:
+        show = lines[:avail - 1] + ["…"]
+    for i, ln in enumerate(show):
+        try:
+            stdscr.addnstr(top + 1 + i, x0 + 1, ln[:inner - 1], inner - 1)
+        except curses.error:
+            pass
+
+
+def draw_empty_slot(stdscr, top, x0, height, cw):
+    if height < 2 or cw < 8:
+        return
+    inner = cw - 1
+    try:
+        stdscr.attron(curses.A_DIM)
+        stdscr.addnstr(top, x0, ("── empty ").ljust(inner - 6, "─")[:inner - 6] + " [add] ", inner)
+        stdscr.addnstr(top + max(1, height // 2), x0 + 1,
+                       "+ click [add] to create a block"[:inner - 1], inner - 1)
+        stdscr.attroff(curses.A_DIM)
+    except curses.error:
+        pass
+
+
+def cell_rects(cards_top, cards_h, w):
+    """The four cell rectangles (TL, TR, BL, BR): (top, x0, height, width)."""
+    row_h = cards_h // 2
+    col_w = w // 2
+    return [
+        (cards_top,          0,     row_h,           col_w),
+        (cards_top,          col_w, row_h,           w - col_w),
+        (cards_top + row_h,  0,     cards_h - row_h, col_w),
+        (cards_top + row_h,  col_w, cards_h - row_h, w - col_w),
+    ]
+
+
+def draw_grid(stdscr, cards_top, cards_h, w, slots, outs, specs):
+    if cards_h < 4:
+        return
+    for i, (top, x0, ch, cw) in enumerate(cell_rects(cards_top, cards_h, w)):
+        bid = slots[i] if i < len(slots) else None
+        if not bid:
+            draw_empty_slot(stdscr, top, x0, ch, cw)
+            continue
+        o = outs.get(bid)
+        heading = (o or {}).get("title") or (specs.get(bid) or {}).get("title") or bid
+        accent = 6 if i % 2 == 0 else 5
+        draw_card(stdscr, top, x0, ch, cw, heading, block_body_lines(o, cw - 3), accent)
+
+
+def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents, slots, outs, specs, unread):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     title = "  Linear — my active tickets"
-    count = f"{n_tickets} tickets · {n_agents} agents · {len(live)} live  "
+    count = (f"{n_tickets} tickets · {n_agents} agents · {len(live)} live "
+             + (f"· {len(unread)} unread " if unread else " "))
     stdscr.attron(curses.A_BOLD)
     stdscr.addnstr(0, 0, title.ljust(max(0, w - len(count))) + count, w - 1)
     stdscr.attroff(curses.A_BOLD)
     stdscr.hline(1, 0, curses.ACS_HLINE, w)
 
-    body_top = 2
-    body_h = max(1, h - body_top - 1)
+    body_top, list_h, cards_h = compute_layout(h, len(rows))
     maxw = w - 1
 
-    for row, entry in enumerate(rows[top:top + body_h]):
+    for row, entry in enumerate(rows[top:top + list_h]):
         y = body_top + row
         kind = entry[0]
 
@@ -245,8 +446,14 @@ def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents):
                 pass
             stdscr.attroff(curses.A_REVERSE)
 
-        is_live = obj.get("id", "?") in live
-        x = add_seg(stdscr, y, 0, f" {'●' if is_live else ' '} ", 3, 3 if is_live else 0, sel, maxw)
+        bid = obj.get("id", "?")
+        if bid in unread:                       # finished, not yet opened
+            dot, dcol = "●", 7                  # blue
+        elif bid in live:                       # live session
+            dot, dcol = "●", 3                  # green
+        else:
+            dot, dcol = " ", 0
+        x = add_seg(stdscr, y, 0, f" {dot} ", 3, dcol, sel, maxw)
         if kind == "ticket":
             state = obj.get("state") or ""
             prtext, prcolor, rtext, rcolor = pr_cells(obj.get("pr"))
@@ -263,9 +470,12 @@ def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents):
                 name = "claude (free agent)"
             x = add_seg(stdscr, y, x, name, max(10, maxw - x), 0, sel, maxw)
 
+    if cards_h > 0:
+        draw_grid(stdscr, body_top + list_h, cards_h, w, slots, outs, specs)
+
     split = f" · ▶ {shown}" if shown else ""
     footer = (" ↑/↓ move · ⏎ open · y split" + split +
-              " · a add · x remove · g back · r refresh · q detach ")
+              " · a add · x remove · 1-4 blocks · g back · r refresh · q detach ")
     try:
         stdscr.attron(curses.A_DIM)
         stdscr.addnstr(h - 1, 0, (status_line or footer)[:maxw], maxw)
@@ -280,11 +490,21 @@ def main(stdscr):
     curses.curs_set(0)
     curses.use_default_colors()
     for i, fg in [(3, curses.COLOR_GREEN), (4, curses.COLOR_RED),
-                  (5, curses.COLOR_YELLOW), (6, curses.COLOR_MAGENTA)]:
+                  (5, curses.COLOR_YELLOW), (6, curses.COLOR_MAGENTA),
+                  (7, curses.COLOR_BLUE)]:
         try:
             curses.init_pair(i, fg, -1)
         except curses.error:
             pass
+    # Mouse: single-click selects a row, double-click opens a ticket in Linear.
+    # (Terminals can't report macOS Cmd, so the gesture is double-click, not
+    # Cmd-click.) mouseinterval > 0 is required for double-click detection.
+    try:
+        curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
+                         | curses.BUTTON1_PRESSED)
+        curses.mouseinterval(250)
+    except curses.error:
+        pass
     # Short poll so cycling feels live; expensive work (tmux queries, re-marking
     # the cockpit) is throttled below so we don't spawn subprocesses 8×/sec.
     stdscr.timeout(120)
@@ -312,7 +532,12 @@ def main(stdscr):
     last_poll = 0.0
     last_mark = 0.0
     live = set()
+    unread = set()       # ids with a finished, unopened session (blue dot)
     shown = ""
+    slots = []           # 2x2 grid block ids, loaded each poll
+    block_outs = {}      # id -> output.json payload
+    block_specs = {}     # id -> spec.json
+    last_block_sweep = 0.0
     pending = None       # id whose preview is waiting to settle
     pending_ts = 0.0
     status_line = ""
@@ -327,6 +552,7 @@ def main(stdscr):
 
         if now - last_poll >= POLL_SECS:
             live = live_tickets()
+            unread = load_unread()
             shown = cockpit_shown()
             agents = load_agents()
             last_poll = now
@@ -334,6 +560,17 @@ def main(stdscr):
                 fetch_blocking(stdscr)
                 tickets = load_tickets()
                 last_fetch = time.time()
+            # Info-card grid: load each slot's cached output for rendering, and
+            # on a slow throttle ask gl-block to refresh each block (gl-block
+            # owns freshness per the block's cadence and no-ops when fresh).
+            slots = load_registry()
+            block_outs = {b: load_block_output(b) for b in slots if b}
+            block_specs = {b: load_block_spec(b) for b in slots if b}
+            if now - last_block_sweep >= 30:
+                for b in slots:
+                    if b:
+                        run_bg([os.path.join(BIN, "gl-block"), b])
+                last_block_sweep = now
 
         tickets_view = order_tickets(tickets, live)   # live sessions on top
         items = build_items(tickets_view, agents)
@@ -352,7 +589,8 @@ def main(stdscr):
             last_order = order
 
         h, _ = stdscr.getmaxyx()
-        body_h = max(1, h - 3)
+        _bt, list_h, _ch = compute_layout(h, len(rows))
+        body_h = list_h          # paging / scroll follow the visible list height
 
         # Follow the shared selection so cmd+` / gl-cycle (separate processes)
         # move the highlight here too.
@@ -376,7 +614,8 @@ def main(stdscr):
             run_bg([os.path.join(BIN, "gl-preview"), pending])
             pending = None
 
-        draw(stdscr, rows, idx, top, live, status_line, shown, len(tickets), len(agents))
+        draw(stdscr, rows, idx, top, live, status_line, shown, len(tickets), len(agents),
+             slots, block_outs, block_specs, unread)
         status_line = ""
 
         try:
@@ -387,9 +626,60 @@ def main(stdscr):
         if c == -1:
             continue
 
+        # Paste / drag-drop guard. A real keypress arrives alone within a poll
+        # window; a paste (e.g. Ghostty pasting a dropped image's shell-escaped
+        # file path) dumps many characters at once. Drain what's already queued:
+        # if a burst follows, it's a paste/drop, so swallow the whole thing
+        # instead of running each character as a command. Without this, path
+        # characters fire destructive keys — 'a' (add agent), the 'x' in a
+        # "1920x1080" filename (remove agent), a stray 'q' (detach) — which is
+        # the "spawns agents / kills agents / crashes" bug.
+        stdscr.timeout(0)                 # non-blocking: drain the input buffer
+        burst = 0
+        while stdscr.getch() != -1:
+            burst += 1
+            if burst > 8192:              # pathologically large paste; stop draining
+                break
+        stdscr.timeout(120)               # restore the normal poll cadence
+        if burst >= 3:
+            status_line = " ignored paste/drop — focus a claude pane before dropping an image "
+            continue
+
         cur = items[idx] if n else None
         moved = False
-        if c in (curses.KEY_UP, ord("k")):
+        if c == curses.KEY_MOUSE:
+            try:
+                _mid, mx, my, _mz, bstate = curses.getmouse()
+            except curses.error:
+                bstate, mx, my = 0, -1, -1
+            mh, mw = stdscr.getmaxyx()
+            _bt, l_h, c_h = compute_layout(mh, len(rows))
+            cards_top = 2 + l_h
+            if c_h > 0 and my >= cards_top:
+                # A click in the 2x2 block grid: the [edit] title bar (or anywhere
+                # in an empty cell) opens that slot's authoring session.
+                for si, (cy, cx, ch, cwid) in enumerate(cell_rects(cards_top, c_h, mw)):
+                    if cy <= my < cy + ch and cx <= mx < cx + cwid:
+                        empty = not (slots[si] if si < len(slots) else None)
+                        if empty or my == cy:
+                            run_bg([os.path.join(BIN, "gl-block-edit"), str(si)])
+                            status_line = f" configuring block {si + 1} — chat on the right "
+                        break
+            else:
+                row_i = top + (my - 2)      # body rows start at screen row 2
+                if 0 <= row_i < len(rows) and rows[row_i][0] != "header":
+                    item_idx = rows[row_i][2]
+                    if bstate & curses.BUTTON1_DOUBLE_CLICKED:
+                        it = items[item_idx]
+                        url = it["data"].get("url") if it["kind"] == "ticket" else None
+                        if url:
+                            run_bg(["open", url])
+                            status_line = f" opening {it['id']} in Linear "
+                        else:
+                            status_line = " no Linear URL for that row "
+                    else:                    # single click: select (+ preview via tail)
+                        idx = item_idx; moved = True
+        elif c in (curses.KEY_UP, ord("k")):
             idx = max(0, idx - 1); moved = True
         elif c in (curses.KEY_DOWN, ord("j")):
             idx = min(n - 1, idx + 1) if n else 0; moved = True
@@ -397,6 +687,22 @@ def main(stdscr):
             idx = min(n - 1, idx + body_h) if n else 0; moved = True
         elif c == curses.KEY_PPAGE:
             idx = max(0, idx - body_h); moved = True
+        elif c in (curses.KEY_RIGHT, ord("l")):
+            # Hop into the right (content) pane. If the split is already up, just
+            # move focus there; otherwise open the current selection into it
+            # (gl-split shows it and lands focus on the right). Doesn't start a
+            # session — that's still Enter.
+            rp = cockpit_right_pane()
+            if rp:
+                run_bg([TMUX, "select-pane", "-t", rp])
+                status_line = " → right pane "
+            elif cur:
+                run_bg([os.path.join(BIN, "gl-split"), cur["id"]])
+        elif c in (ord("1"), ord("2"), ord("3"), ord("4")):
+            # Keyboard path to the block grid (TL,TR,BL,BR = 1,2,3,4): configure
+            # that slot (creates a new block if it's empty).
+            run_bg([os.path.join(BIN, "gl-block-edit"), str(c - ord("1"))])
+            status_line = f" configuring block {chr(c)} — chat on the right "
         elif c in (curses.KEY_ENTER, 10, 13):
             if cur:
                 run_bg([os.path.join(BIN, "gl-open"), cur["id"]])

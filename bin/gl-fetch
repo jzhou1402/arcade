@@ -16,17 +16,18 @@ fi
 read -r -d '' QUERY <<'GQL' || true
 query {
   viewer {
+    id
     assignedIssues(
       first: 100
       filter: { state: { type: { in: ["triage", "backlog", "unstarted", "started"] } } }
     ) {
-      nodes { identifier title url branchName priority updatedAt state { name type } attachments { nodes { url } } }
+      nodes { identifier title url branchName priority updatedAt state { name type } assignee { id } attachments { nodes { url } } }
     }
     createdIssues(
       first: 100
       filter: { state: { type: { in: ["triage", "backlog", "unstarted", "started"] } } }
     ) {
-      nodes { identifier title url branchName priority updatedAt state { name type } attachments { nodes { url } } }
+      nodes { identifier title url branchName priority updatedAt state { name type } assignee { id } attachments { nodes { url } } }
     }
   }
 }
@@ -41,11 +42,16 @@ if ! printf '%s' "$resp" | jq -e '.data.viewer' >/dev/null 2>&1; then
   exit 1
 fi
 
-# Union of issues assigned to me OR created by me (you don't always self-assign),
-# deduped by identifier. Linear is the source of truth for the linked PR (attachment URL).
+# Issues assigned to me, OR created by me but not handed off — i.e. drop any
+# issue assigned to someone else (a created-by-me ticket reassigned away). An
+# unassigned created-by-me ticket is kept (you don't always self-assign).
+# Deduped by identifier. Linear is the source of truth for the linked PR.
 base="$(printf '%s' "$resp" | jq '
-  [ (.data.viewer.assignedIssues.nodes + .data.viewer.createdIssues.nodes)
-    | unique_by(.identifier) | .[] | {
+  (.data.viewer.id) as $me
+  | [ (.data.viewer.assignedIssues.nodes + .data.viewer.createdIssues.nodes)
+    | unique_by(.identifier) | .[]
+    | select(.assignee == null or .assignee.id == $me)
+    | {
       id: .identifier,
       title: .title,
       url: .url,
@@ -112,3 +118,12 @@ fi
 
 mv "$tmp" "$GL_TICKETS"
 gl_log "Wrote $(jq 'length' "$GL_TICKETS") tickets to $GL_TICKETS"
+
+# Reconcile running sessions against the freshly-written active set: any live
+# ticket session Linear no longer pulls (merged/closed/deprioritised) has its
+# dev servers + claude killed, its window closed, and its worktree removed.
+# Only reached on a successful fetch (the query-failure paths above exit early),
+# so a transient Linear outage never triggers a reap.
+if gl_session_exists; then
+  gl_reap_orphans || gl_log "reap: reconcile pass failed (non-fatal)"
+fi

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Block generator: "Langfuse Trace of the Day". Prints a render payload (JSON) to
+# stdout; gl-block owns caching/status/cadence. Interpreter block. Surfaces PROD
+# CUSTOMER DATA locally only — never written anywhere but the block's output cache.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../bin/gl-lib.sh
+. "$DIR/../../bin/gl-lib.sh"
+
+set -a; . "$GL_REPO/.env" 2>/dev/null || true; set +a
+PK="pk-lf-8a5d76cd-daf7-4b68-802a-84c54b1f6b10"
+BASE="https://us.cloud.langfuse.com/api/public"
+[ -n "${LANGFUSE_SECRET_KEY:-}" ] || { gl_log "trace: no LANGFUSE_SECRET_KEY"; exit 1; }
+
+# Recent user turns. The endpoint is slow (~10-30s) and flaky (its server-side
+# name filter times out; unfiltered calls sometimes return empty), so fetch
+# unfiltered with a generous timeout, select in jq, and retry on an empty result.
+batch=""
+for attempt in 1 2 3 4; do
+  batch="$(curl -s --max-time 60 -u "$PK:$LANGFUSE_SECRET_KEY" -G "$BASE/traces" \
+    --data-urlencode "limit=30" --data-urlencode "orderBy=timestamp.desc" 2>/dev/null \
+    | jq -c '[.data[] | select(.name=="POST /agent/stream" and (.input|type)=="string" and (.input|length)>0)
+             | {id, org:((.userId//"") | sub(".*@";"")), ts:.timestamp,
+                q:(.input|tostring|.[0:600]), a:((.output|tostring)|.[0:800])}]' 2>/dev/null || true)"
+  case "$batch" in ""|"[]"|"null") ;; *) break;; esac
+  gl_log "trace: fetch attempt $attempt returned nothing; retrying"
+  sleep 3
+done
+case "$batch" in ""|"[]"|"null") gl_log "trace: no traces after retries"; exit 1;; esac
+
+claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
+
+PROMPT="You are curating a \"Langfuse Trace of the Day\" card for an engineer on the Hazel team (Hazel is an AI data-analyst over a company's data). Below is a JSON array of recent REAL user interactions: id, the user's org (email domain), verbatim message (q), truncated assistant response (a).
+
+Pick the SINGLE most instructive interaction — one that teaches something about how people actually use the product (interesting/ambiguous/hard request, revealing follow-up, clever use, illuminating failure). Prefer real customer orgs over internal (fromhazel.ai) when comparably interesting.
+
+Respond with ONLY a JSON object (no prose, no fences):
+  \"label\":       a 3-6 word topic tag
+  \"org\":         the chosen interaction's org
+  \"quote\":       the user's verbatim message (their q), lightly trimmed if very long
+  \"explanation\": 2-4 sentences on what the user was doing, why it's instructive, and what Hazel did. Refer to the user by org/domain, never a personal name.
+Keep the combined prose under ~1100 characters.
+
+DATA:
+$batch"
+
+raw="$(printf '%s' "$PROMPT" | "$claude_bin" -p --output-format json --dangerously-skip-permissions 2>/dev/null || true)"
+text="$(printf '%s' "$raw" | jq -r '.result // empty' 2>/dev/null || true)"
+[ -n "$text" ] || text="$raw"
+
+t="$(printf '%s' "$text" | python3 -c '
+import sys, json
+s = sys.stdin.read()
+i, j = s.find("{"), s.rfind("}")
+if i >= 0 and j > i:
+    try:
+        print(json.dumps(json.loads(s[i:j+1])))
+    except Exception:
+        pass
+' 2>/dev/null || true)"
+
+printf '%s' "$t" | jq -e '.quote and .explanation' >/dev/null 2>&1 || { gl_log "trace: no valid JSON"; exit 1; }
+
+printf '%s' "$t" | jq '{
+  title: ("Langfuse Trace of the Day" + (if .label then " · " + .label else "" end)),
+  mode: "interpreter",
+  elements: [
+    {type:"quote", text:.quote, cite:(.org // null)},
+    {type:"text",  text:.explanation}
+  ]
+}'

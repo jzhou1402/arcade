@@ -17,7 +17,7 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.6.3"
+GL_VERSION="0.7.0"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
@@ -28,6 +28,8 @@ GL_AGENTS="$GL_CACHE/agents.json"   # registry of ad-hoc "free agent" claude win
 GL_SELECTED="$GL_CACHE/selected"
 GL_ORDER="$GL_CACHE/order"          # dashboard's current visible id order (for gl-cycle)
 GL_BRIEFS="$GL_CACHE/briefs"
+GL_BLOCKS="$GL_CONFIG_DIR/blocks"            # user-authored dashboard blocks
+GL_BLOCKS_REGISTRY="$GL_CONFIG_DIR/blocks.json"  # 2x2 grid slot assignment
 
 GL_REPO="${GL_REPO:-$HOME/hazel}"
 GL_WORKTREE_BASE="${GL_WORKTREE_BASE:-$HOME/worktrees}"
@@ -45,6 +47,55 @@ TMUX_BIN="${TMUX_BIN:-$(command -v tmux)}"
 GL_KEYCHAIN_SERVICE="ghostty-linear-token"
 
 mkdir -p "$GL_CACHE" "$GL_BRIEFS" "$GL_WORKTREE_BASE" 2>/dev/null || true
+
+GL_LOCKDIR="$GL_CACHE/cockpit.lock.d"
+
+# --- cockpit mutation mutex ---------------------------------------------------
+# The cockpit's panes are mutated by several independent processes (gl-preview
+# on navigation, gl-open, gl-split, gl-cycle). Without serialization, a slow
+# gl_ensure_window (worktree + claude launch) in one leaves a gap where another
+# adds a pane — producing a stray third column between the dashboard and the
+# content pane. macOS has no flock, so use an atomic mkdir mutex with pid-based
+# stale detection (a crashed holder's lock is stolen, never a live one's).
+_gl_lock_take() {
+  if mkdir "$GL_LOCKDIR" 2>/dev/null; then
+    printf '%s' "$$" > "$GL_LOCKDIR/pid" 2>/dev/null || true
+    trap 'gl_unlock' EXIT INT TERM
+    return 0
+  fi
+  local holder
+  holder="$(cat "$GL_LOCKDIR/pid" 2>/dev/null || true)"
+  if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+    rm -rf "$GL_LOCKDIR" 2>/dev/null || true
+    if mkdir "$GL_LOCKDIR" 2>/dev/null; then
+      printf '%s' "$$" > "$GL_LOCKDIR/pid" 2>/dev/null || true
+      trap 'gl_unlock' EXIT INT TERM
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Release the lock only if we own it (pid matches), so a slow process finishing
+# late can never drop the lock a newer holder has since taken.
+gl_unlock() {
+  [ "$(cat "$GL_LOCKDIR/pid" 2>/dev/null || true)" = "$$" ] && rm -rf "$GL_LOCKDIR" 2>/dev/null || true
+}
+
+# Non-blocking acquire: 0 if taken, 1 if busy. For best-effort callers (preview).
+gl_trylock() { _gl_lock_take; }
+
+# Blocking acquire up to N seconds (default 20): 0 on success, 1 on timeout.
+gl_lock() {
+  local timeout="${1:-20}" i=0 max
+  max=$((timeout * 10))
+  while ! _gl_lock_take; do
+    sleep 0.1
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] && return 1
+  done
+  return 0
+}
 
 # Linear personal API key, resolved from the macOS Keychain (falls back to env).
 gl_token() {
@@ -99,6 +150,33 @@ gl_is_free() {
 gl_is_ticket() {
   [ -f "$GL_TICKETS" ] || return 1
   [ "$(jq -r --arg id "$1" 'any(.[]; .id==$id)' "$GL_TICKETS" 2>/dev/null)" = "true" ]
+}
+
+# The id the dashboard selection lands on after $1 is removed, mirroring the
+# dashboard's own clamp: the item after $1 in the visible order, else the item
+# before it, else empty (nothing left). Order comes from $GL_ORDER (what the
+# dashboard publishes), falling back to tickets + agents.
+gl_next_after() {
+  local cur="$1" line pos i
+  local ids=()
+  if [ -f "$GL_ORDER" ]; then
+    while IFS= read -r line; do [ -n "$line" ] && ids+=("$line"); done < "$GL_ORDER"
+  fi
+  if [ "${#ids[@]}" -eq 0 ]; then
+    while IFS= read -r line; do [ -n "$line" ] && ids+=("$line"); done < <(jq -r '.[].id' "$GL_TICKETS" 2>/dev/null)
+    while IFS= read -r line; do [ -n "$line" ] && ids+=("$line"); done < <(gl_agent_ids)
+  fi
+  pos=-1
+  for i in "${!ids[@]}"; do [ "${ids[$i]}" = "$cur" ] && { pos="$i"; break; }; done
+  if [ "$pos" -lt 0 ]; then
+    printf '%s' "${ids[0]:-}"                     # cur not listed: fall to first
+  elif [ $(( pos + 1 )) -lt "${#ids[@]}" ]; then
+    printf '%s' "${ids[$(( pos + 1 ))]}"          # the item after cur
+  elif [ "$pos" -gt 0 ]; then
+    printf '%s' "${ids[$(( pos - 1 ))]}"          # cur was last: the item before
+  else
+    printf ''                                     # cur was the only item
+  fi
 }
 
 # First N words of a string.
@@ -231,7 +309,7 @@ gl_ensure_window() {
     shell="${SHELL:-/bin/zsh}"
     title="$(gl_title "$id")"
     wt="$GL_AGENT_DIR"; [ -d "$wt" ] || wt="$HOME"
-    launch="$(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id"); exec $(printf '%q' "$shell") -l"
+    launch="GL_TICKET=$(printf '%q' "$id") $(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id"); exec $(printf '%q' "$shell") -l"
     win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "$title" -c "$wt" -P -F '#{window_id}' "$launch")"
     "$TMUX_BIN" set-window-option -t "$win" @ticket "$id" >/dev/null
     "$TMUX_BIN" set-window-option -t "$win" automatic-rename off >/dev/null
@@ -277,7 +355,7 @@ gl_ensure_window() {
 3. A quick local orientation brief is cached at ${brief} if you want a fast overview before the MCP calls.
 Then give me a concise summary of the task and its current state (Linear status + PR/CI/review status) and propose a short plan BEFORE changing any code. If node_modules is missing in this worktree, run pnpm install first."
 
-  launch="$(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id") $(printf '%q' "$prompt"); exec $(printf '%q' "$shell") -l"
+  launch="GL_TICKET=$(printf '%q' "$id") $(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id") $(printf '%q' "$prompt"); exec $(printf '%q' "$shell") -l"
 
   win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "$title" -c "$wt" -P -F '#{window_id}' "$launch")"
   "$TMUX_BIN" set-window-option -t "$win" @ticket "$id" >/dev/null
@@ -353,9 +431,13 @@ gl_show_claude() {
     return 0                                   # already showing this claude
   fi
 
-  gl_clear_right "$cockpit"
+  # Build/find the ticket's window FIRST (gl_ensure_window can be slow: worktree
+  # + claude launch). Only then disturb the cockpit, so the right pane is
+  # cleared and the new one joined back-to-back — no gap for a racing mutator to
+  # slip a third pane into.
   winid="$(gl_ensure_window "$id")"
   srcpane="$("$TMUX_BIN" list-panes -t "$winid" -F '#{pane_id}' | head -1)"
+  gl_clear_right "$cockpit"
   dash="$(_gl_cockpit_dash "$cockpit")" || { gl_log "Cockpit has no dashboard pane."; return 1; }
   "$TMUX_BIN" join-pane -h -l '55%' -s "$srcpane" -t "$dash"
   "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" @shown "$id" >/dev/null
@@ -394,3 +476,204 @@ gl_show_ticket() {
 
 # Back-compat alias.
 gl_show_in_cockpit() { gl_show_claude "$1"; }
+
+# --- teardown: reap a ticket's session + worktree once it leaves the active set
+# When a Linear refresh no longer pulls a ticket (merged/closed/deprioritised),
+# its claude session + dev servers + worktree are orphaned: they keep running
+# but the dashboard can't even show them. gl_teardown reaps one; gl_reap_orphans
+# reconciles the whole session against tickets.json (called at the end of a
+# successful gl-fetch). Free agents and anything living in the main repo are
+# never touched.
+
+# All descendant pids of a root pid (inclusive), one per line.
+gl_pid_tree() {
+  local root="$1" k
+  [ -n "$root" ] || return 0
+  printf '%s\n' "$root"
+  for k in $(pgrep -P "$root" 2>/dev/null || true); do gl_pid_tree "$k"; done
+}
+
+# Pids whose current working directory is at or under $1. Single lsof pass keyed
+# on the cwd fd, so a huge node_modules is never walked.
+gl_pids_with_cwd_under() {
+  local dir="$1"
+  [ -n "$dir" ] || return 0
+  lsof -d cwd -Fpn 2>/dev/null | awk -v d="$dir" '
+    /^p/ { pid = substr($0, 2); next }
+    /^n/ { p = substr($0, 2); if (p == d || index(p, d "/") == 1) print pid }'
+}
+
+# True when a pid must never be killed by teardown: Claude Code's shared daemon
+# / pty hosts (killing them would take down unrelated sessions), the tmux server,
+# and this process itself.
+_gl_protected_pid() {
+  local p="$1" cmd
+  [ "$p" = "$$" ] && return 0
+  [ "$p" = "1" ] && return 0
+  cmd="$(ps -o command= -p "$p" 2>/dev/null || true)"
+  case "$cmd" in
+    *"daemon run"*|*"bg-pty-host"*|*"bg-spare"*) return 0;;  # shared Claude Code infra
+    *"/tmux"*|"tmux "*|*" tmux") return 0;;
+  esac
+  return 1
+}
+
+# SIGTERM a set of pids, give them a moment, then SIGKILL survivors. Skips any
+# protected pid. Accepts a whitespace-separated list.
+gl_kill_pids() {
+  local pids p
+  pids="$(printf '%s\n' $1 | awk 'NF' | sort -un)"
+  [ -n "$pids" ] || return 0
+  for p in $pids; do _gl_protected_pid "$p" || kill -TERM "$p" 2>/dev/null || true; done
+  sleep 0.5
+  for p in $pids; do _gl_protected_pid "$p" || kill -KILL "$p" 2>/dev/null || true; done
+}
+
+# The id a window belongs to, resilient to a tmux-resurrect restore (which drops
+# the @ticket user option but restores the command line): prefer @ticket, else
+# the `claude -n <id>` argument running in the window, else the window-name prefix.
+gl_window_id() {
+  local win="$1" id pp p
+  id="$("$TMUX_BIN" show-window-options -t "$win" -v @ticket 2>/dev/null || true)"
+  if [ -z "$id" ]; then
+    while IFS= read -r pp; do
+      [ -n "$pp" ] || continue
+      id="$(for p in $(gl_pid_tree "$pp"); do ps -o command= -p "$p" 2>/dev/null; done \
+            | sed -n 's/.*[[:space:]]-n[[:space:]]\{1,\}\([A-Za-z][A-Za-z0-9]*-[0-9A-Za-z]\{1,\}\).*/\1/p' \
+            | head -1)"
+      [ -n "$id" ] && break
+    done < <("$TMUX_BIN" list-panes -t "$win" -F '#{pane_pid}' 2>/dev/null)
+  fi
+  if [ -z "$id" ]; then
+    id="$("$TMUX_BIN" display-message -p -t "$win" '#{window_name}' 2>/dev/null | awk '{print $1}')"
+    case "$id" in [A-Za-z]*-[0-9]*) ;; *) id="";; esac
+  fi
+  printf '%s' "$id"
+}
+
+# True when $1 is a worktree teardown may delete/sweep: a real dir under
+# GL_WORKTREE_BASE and never the main repo, $HOME, or /.
+gl_is_disposable_worktree() {
+  local wt="$1"
+  [ -n "$wt" ] && [ -d "$wt" ] || return 1
+  case "$wt" in "$GL_REPO"|"$HOME"|"/"|"") return 1;; esac
+  case "$wt/" in "$GL_WORKTREE_BASE/"*) return 0;; *) return 1;; esac
+}
+
+# True when a worktree holds work worth preserving: uncommitted or untracked
+# changes, or commits not on its upstream. Conservative — if it can't confirm the
+# branch is fully pushed (no upstream configured), it reports dirty. Teardown
+# keeps a dirty worktree (killing only the session) instead of force-removing it.
+gl_worktree_is_dirty() {
+  local wt="$1" up ahead
+  [ -d "$wt" ] || return 1
+  [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] && return 0
+  up="$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  [ -z "$up" ] && return 0
+  ahead="$(git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null || printf '0')"
+  [ "${ahead:-0}" -gt 0 ] && return 0
+  return 1
+}
+
+# Reap a single ticket id: (1) dev servers running for its worktree + (2) its
+# claude session, then (3) its tmux window(s)/cockpit pane, then (4) the worktree.
+# No-op for free agents; never sweeps or removes the main repo.
+gl_teardown() {
+  local id="$1" wt cockpit shown cp w cock panes wins p pp treepids cwdpids
+  [ -n "$id" ] || return 0
+  if gl_is_free "$id"; then gl_log "teardown: $id is a free agent — skipping."; return 0; fi
+
+  wt="$(gl_worktree "$id")"
+
+  # Panes hosting this id: standalone windows (never the cockpit) plus the
+  # cockpit's right pane when this id is the one joined in.
+  panes=""; wins=""
+  while IFS='|' read -r w cock; do
+    [ "$cock" = "1" ] && continue
+    [ "$(gl_window_id "$w")" = "$id" ] || continue
+    wins="$wins $w"
+    panes="$panes $("$TMUX_BIN" list-panes -t "$w" -F '#{pane_id}' 2>/dev/null | tr '\n' ' ')"
+  done < <("$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_id}|#{@cockpit}' 2>/dev/null)
+
+  cockpit="$(gl_cockpit_window || true)"
+  cp=""
+  if [ -n "$cockpit" ] && [ "$(gl_shown_ticket "$cockpit")" = "$id" ]; then
+    cp="$(gl_cockpit_claude_pane "$cockpit")"
+    [ -n "$cp" ] && panes="$panes $cp"
+  fi
+
+  # (1)+(2) Kill the dev servers and the claude session together: the union of
+  # every pid descended from those panes and every pid whose cwd is inside the
+  # worktree (catches servers that escaped the pane's tree, e.g. Claude Code
+  # background tasks reparented under the daemon). cwd sweep only for a
+  # disposable worktree, so the main repo's servers are never touched.
+  treepids=""
+  for p in $panes; do
+    pp="$("$TMUX_BIN" display-message -p -t "$p" '#{pane_pid}' 2>/dev/null || true)"
+    [ -n "$pp" ] && treepids="$treepids $(gl_pid_tree "$pp" | tr '\n' ' ')"
+  done
+  cwdpids=""
+  gl_is_disposable_worktree "$wt" && cwdpids="$(gl_pids_with_cwd_under "$wt" | tr '\n' ' ')"
+  gl_kill_pids "$treepids $cwdpids"
+
+  # (3) Tmux: drop the cockpit's right pane (keeping the dashboard) and kill any
+  # standalone window(s) for this id.
+  if [ -n "$cp" ]; then
+    "$TMUX_BIN" kill-pane -t "$cp" 2>/dev/null || true
+    "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown 2>/dev/null || true
+    "$TMUX_BIN" set-window-option -t "$GL_SESSION:$cockpit" -u @shown_kind 2>/dev/null || true
+  fi
+  for w in $wins; do "$TMUX_BIN" kill-window -t "$w" 2>/dev/null || true; done
+
+  # (4) Remove the worktree, never the main repo. A worktree with uncommitted or
+  # unpushed work is preserved (the session is still torn down) so a ticket that
+  # dropped out mid-task never loses code; clean ones are force-removed.
+  if gl_is_disposable_worktree "$wt"; then
+    if gl_worktree_is_dirty "$wt"; then
+      gl_log "teardown: $id worktree $wt has uncommitted/unpushed work — session killed, worktree KEPT."
+    else
+      git -C "$GL_REPO" worktree remove --force "$wt" 2>/dev/null \
+        || gl_log "teardown: could not remove worktree $wt (left in place)"
+      git -C "$GL_REPO" worktree prune 2>/dev/null || true
+    fi
+  fi
+  gl_log "teardown: reaped $id"
+}
+
+# Reconcile the whole session against tickets.json: tear down every live ticket
+# session whose id is no longer in the active set. Safe no-op if the cache is
+# missing/unparseable or (guard) came back empty — a suspicious empty fetch must
+# not nuke every session.
+gl_reap_orphans() {
+  local active cockpit shown w cock id
+  active="$(jq -r '.[].id' "$GL_TICKETS" 2>/dev/null || true)"
+  if ! jq -e 'type == "array"' "$GL_TICKETS" >/dev/null 2>&1; then
+    gl_log "reap: tickets.json missing/unparseable — skipping."; return 0
+  fi
+  if [ -z "$active" ]; then
+    gl_log "reap: active ticket set is empty — skipping to avoid reaping everything."; return 0
+  fi
+
+  while IFS='|' read -r w cock; do
+    [ "$cock" = "1" ] && continue
+    id="$(gl_window_id "$w")"
+    [ -n "$id" ] || continue
+    gl_is_free "$id" && continue
+    case "$id" in [A-Za-z]*-[0-9]*) ;; *) continue;; esac
+    if ! printf '%s\n' "$active" | grep -qxF "$id"; then
+      gl_log "reap: $id no longer active — tearing down."
+      gl_teardown "$id"
+    fi
+  done < <("$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_id}|#{@cockpit}' 2>/dev/null)
+
+  cockpit="$(gl_cockpit_window || true)"
+  if [ -n "$cockpit" ]; then
+    shown="$(gl_shown_ticket "$cockpit")"
+    if [ -n "$shown" ] && ! gl_is_free "$shown" \
+       && ! printf '%s\n' "$active" | grep -qxF "$shown"; then
+      case "$shown" in
+        [A-Za-z]*-[0-9]*) gl_log "reap: cockpit ticket $shown no longer active — tearing down."; gl_teardown "$shown";;
+      esac
+    fi
+  fi
+}

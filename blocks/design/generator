@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Block generator: "Design of the Day". Prints a render payload (JSON) to stdout;
+# gl-block owns caching/status/cadence. Interpreter block — reasons over the repo
+# via `claude -p` each refresh.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../bin/gl-lib.sh
+. "$DIR/../../bin/gl-lib.sh"
+
+HIST="$DIR/history"
+[ -d "$GL_REPO/.git" ] || { gl_log "design: no repo at $GL_REPO"; exit 1; }
+claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
+avoid="$([ -f "$HIST" ] && tail -25 "$HIST" | paste -sd';' - 2>/dev/null || true)"
+
+read -r -d '' PROMPT <<EOF || true
+You are curating a "Design of the Day" card shown on an engineer's dashboard.
+The audience is an engineer working to become more senior: the card should make
+them ask "if I had to build a similar system from scratch, would I make the same
+decision?"
+
+Pick ONE concrete, non-obvious design or architecture decision that ACTUALLY
+exists in this repository (the current working directory is the Hazel repo).
+Favour decisions that depart from the mainstream/textbook convention. Verify it
+against real files before writing (grep/read); cite the paths.
+
+Do NOT repeat any of these recently-featured topics: ${avoid:-none}.
+
+Respond with ONLY a single JSON object (no prose, no fences) with keys:
+  "title":      short name of the decision, <= 60 chars
+  "decision":   what Hazel actually does, 2-3 sentences
+  "convention": the mainstream alternative it departs from, 1-2 sentences
+  "rationale":  why it was designed this way here, grounded in the repo, 2-4 sentences
+  "verdict":    a candid "would a senior engineer building this from scratch make
+                the same call?" reflection, tradeoffs + when it would NOT apply, 2-4 sentences
+  "refs":       array of up to 3 real repo file paths that evidence this
+Keep the combined prose under ~1400 characters.
+EOF
+
+raw="$(cd "$GL_REPO" && "$claude_bin" -p --output-format json --dangerously-skip-permissions "$PROMPT" 2>/dev/null || true)"
+text="$(printf '%s' "$raw" | jq -r '.result // empty' 2>/dev/null || true)"
+[ -n "$text" ] || text="$raw"
+
+d="$(printf '%s' "$text" | python3 -c '
+import sys, json
+s = sys.stdin.read()
+i, j = s.find("{"), s.rfind("}")
+if i >= 0 and j > i:
+    try:
+        print(json.dumps(json.loads(s[i:j+1])))
+    except Exception:
+        pass
+' 2>/dev/null || true)"
+
+printf '%s' "$d" | jq -e '.title and .decision' >/dev/null 2>&1 || { gl_log "design: no valid JSON"; exit 1; }
+printf '%s\n' "$(printf '%s' "$d" | jq -r '.title')" >> "$HIST"
+
+printf '%s' "$d" | jq '{
+  title: ("Design of the Day · " + .title),
+  mode: "interpreter",
+  elements: ([
+    {type:"text",    text:.decision},
+    {type:"section", label:"Convention",    text:.convention},
+    {type:"section", label:"Why here",      text:.rationale},
+    {type:"section", label:"From scratch?", text:.verdict}
+  ] + (if ((.refs|type)=="array" and (.refs|length)>0)
+       then [{type:"text", text:("refs: " + (.refs|join(", ")))}] else [] end))
+}'
