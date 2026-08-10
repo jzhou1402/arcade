@@ -50,6 +50,15 @@ else
 fi
 [ "$watching" = "1" ] && exit 0
 
+# Dedupe: a single finish can surface as two Stops (double-fire, or a transient
+# duplicate window). Skip if we already notified for this id in the last 10s —
+# distinct finishes seconds apart are rare; near-simultaneous ones are the bug.
+ndir="$GL_CACHE/notify"; mkdir -p "$ndir" 2>/dev/null || true
+nstamp="$ndir/$id"; nows="$(date +%s)"
+last="$(cat "$nstamp" 2>/dev/null || echo 0)"; case "$last" in ''|*[!0-9]*) last=0;; esac
+[ "$((nows - last))" -lt 10 ] && exit 0
+printf '%s' "$nows" > "$nstamp"
+
 # Notify (macOS). Sanitize the title for AppleScript string literals.
 ntitle="$(gl_title "$id" 2>/dev/null || printf '%s' "$id")"
 ntitle="$(printf '%s' "$ntitle" | tr -d '"\\')"
