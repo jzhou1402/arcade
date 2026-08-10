@@ -141,6 +141,23 @@ def cockpit_right_pane():
     return ""
 
 
+def focused_ticket():
+    """The ticket/agent id whose claude pane is currently focused, else "".
+    Looking at a finished session counts as reading it (blue dot -> green)."""
+    try:
+        out = subprocess.run(
+            [TMUX, "display-message", "-p", "-t", SESSION,
+             "#{@ticket}|#{@cockpit}|#{@shown}|#{@shown_kind}|#{pane_id}|#{@dashpane}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        at, cockpit, shown, kind, pane, dash = (out.stdout.strip().split("|") + [""] * 6)[:6]
+        if cockpit == "1":
+            return shown if (shown and kind == "claude" and pane and pane != dash) else ""
+        return at
+    except Exception:
+        return ""
+
+
 def write_selected(ticket_id):
     try:
         with open(SELECTED, "w") as f:
@@ -552,6 +569,12 @@ def main(stdscr):
 
         if now - last_poll >= POLL_SECS:
             live = live_tickets()
+            foc = focused_ticket()          # viewing a finished session = reading it
+            if foc:
+                try:
+                    os.remove(os.path.join(UNREAD_DIR, foc))
+                except OSError:
+                    pass
             unread = load_unread()
             shown = cockpit_shown()
             agents = load_agents()
