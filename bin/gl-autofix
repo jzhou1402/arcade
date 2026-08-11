@@ -58,8 +58,10 @@ prnum="$(gl_ticket_field "$id" .pr.number 2>/dev/null || true)"
 # Confirm against live refs (the cache lags a just-pushed fix): merge-tree is a
 # pure computation, no working-tree change. rc 0 = clean, 1 = conflicts.
 git -C "$wt" fetch -q origin "$GL_BASE_BRANCH" 2>/dev/null || true
-git -C "$wt" merge-tree --write-tree HEAD "origin/$GL_BASE_BRANCH" >/dev/null 2>&1
-rc=$?
+# NB: `|| rc=$?` is required — merge-tree returns 1 on conflict, which under
+# `set -e` would otherwise abort the script on the very case we want to act on.
+rc=0
+git -C "$wt" merge-tree --write-tree HEAD "origin/$GL_BASE_BRANCH" >/dev/null 2>&1 || rc=$?
 if [ "$rc" = "0" ]; then
   rm -f "$cnt_file" 2>/dev/null || true     # already clean (e.g. fix landed)
   exit 1
