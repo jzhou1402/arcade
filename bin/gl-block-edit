@@ -39,6 +39,18 @@ else
   bdir="$GL_BLOCKS/$id"
 fi
 
+# If an authoring session for this block is already alive — a standalone window
+# (broken out when you navigated away) or one joined in the cockpit — return to
+# it instead of spawning a duplicate. gl_ensure_window (via gl_show_claude) finds
+# the existing window rather than creating one.
+if [ -n "$(gl_window_for "$id" 2>/dev/null || true)" ]; then
+  gl_lock 15 || true
+  gl_show_claude "$id" >/dev/null 2>&1 || true
+  cockpit="$(gl_cockpit_window || true)"
+  [ -n "$cockpit" ] && gl_focus_right "$cockpit"
+  exit 0
+fi
+
 # Mark it as being configured so the background sweep leaves it alone.
 tmp="$(mktemp)"; jq '.status="configuring"' "$bdir/spec.json" > "$tmp" 2>/dev/null && mv "$tmp" "$bdir/spec.json" || rm -f "$tmp"
 
@@ -72,6 +84,8 @@ EOF
 
 launch="$(printf '%q ' "$claude_bin") --dangerously-skip-permissions $(printf '%q' "$SEED"); exec $(printf '%q' "${SHELL:-/bin/zsh}") -l"
 win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "edit $id" -c "$bdir" -P -F '#{window_id}' "$launch")"
+# Tag it so gl_window_for finds this session later (to return to it, not dup it).
+"$TMUX_BIN" set-window-option -t "$win" @ticket "$id" >/dev/null 2>&1 || true
 
 # Join the authoring session into the cockpit's right pane (serialized).
 gl_lock 15 || true
