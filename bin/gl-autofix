@@ -23,9 +23,22 @@ sess="${2:-$id}"
 gl_session_exists || exit 2
 gl_is_free "$id" && exit 2                  # free agents have no branch to rebase
 
-wt="$(gl_worktree "$id")"
-[ -d "$wt/.git" ] || wt="$GL_REPO"          # ticket whose branch is checked out in the main repo
-git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 2
+# Find the pane running this id's idle claude (standalone window or cockpit) and
+# operate in ITS working directory. That's authoritative: the convention path
+# gl_worktree() can differ from where the session actually runs, and a git
+# worktree's .git is a FILE not a dir (so a `-d .git` test wrongly rejects it).
+pane=""
+cockpit="$(gl_cockpit_window || true)"
+if [ -n "$cockpit" ] && [ "$(gl_shown_ticket "$cockpit")" = "$id" ] && [ "$(gl_shown_kind "$cockpit")" = "claude" ]; then
+  pane="$(gl_cockpit_claude_pane "$cockpit")"
+else
+  w="$(gl_window_for "$id" || true)"
+  [ -n "$w" ] && pane="$("$TMUX_BIN" list-panes -t "$GL_SESSION:$w" -F '#{pane_id}' 2>/dev/null | head -1)"
+fi
+[ -n "$pane" ] || exit 2
+
+wt="$("$TMUX_BIN" display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)"
+[ -n "$wt" ] && git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 2
 
 CNT_DIR="$GL_CACHE/autofix"; mkdir -p "$CNT_DIR" 2>/dev/null || true
 cnt_file="$CNT_DIR/$(printf '%s' "$sess" | tr -c 'A-Za-z0-9._-' '_')"
@@ -50,17 +63,6 @@ fi
 # Loop guard: at most 5 autofix pastes per session.
 n="$(cat "$cnt_file" 2>/dev/null || echo 0)"; case "$n" in ''|*[!0-9]*) n=0;; esac
 [ "$n" -ge 5 ] && exit 3
-
-# Find the pane running this id's idle claude (standalone window or cockpit).
-pane=""
-cockpit="$(gl_cockpit_window || true)"
-if [ -n "$cockpit" ] && [ "$(gl_shown_ticket "$cockpit")" = "$id" ] && [ "$(gl_shown_kind "$cockpit")" = "claude" ]; then
-  pane="$(gl_cockpit_claude_pane "$cockpit")"
-else
-  w="$(gl_window_for "$id" || true)"
-  [ -n "$w" ] && pane="$("$TMUX_BIN" list-panes -t "$GL_SESSION:$w" -F '#{pane_id}' 2>/dev/null | head -1)"
-fi
-[ -n "$pane" ] || exit 2
 
 printf '%s' "$((n + 1))" > "$cnt_file"
 
