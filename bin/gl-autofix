@@ -14,6 +14,27 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gl-lib.sh
 . "$DIR/gl-lib.sh"
+[ -n "$TMUX_BIN" ] || exit 1
+
+# Sweep mode: catch sessions already idle + conflicting. The Stop hook only fires
+# at turn-end, so a session sitting idle when its PR went conflicting is never
+# picked up otherwise. For each standalone live ticket window that is idle (not
+# mid-turn), delegate to the single-id path.
+if [ "${1:-}" = "--sweep" ]; then
+  [ -f "$GL_CACHE/autofix-off" ] && exit 0
+  gl_session_exists || exit 0
+  "$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_index}|#{@ticket}|#{@cockpit}' 2>/dev/null \
+    | awk -F'|' '$3 != "1" && $2 != "" { print $1"|"$2 }' \
+    | while IFS='|' read -r _win tid; do
+        case "$tid" in agent-*|block*) continue;; esac
+        p="$("$TMUX_BIN" list-panes -t "$GL_SESSION:$_win" -F '#{pane_id}' 2>/dev/null | head -1)"
+        [ -n "$p" ] || continue
+        # Never paste into a session mid-turn.
+        "$TMUX_BIN" capture-pane -t "$p" -p 2>/dev/null | grep -q "esc to interrupt" && continue
+        "$0" "$tid" >/dev/null 2>&1 || true
+      done
+  exit 0
+fi
 
 id="${1:-}"; [ -n "$id" ] || exit 2
 sess="${2:-$id}"
@@ -41,7 +62,7 @@ wt="$("$TMUX_BIN" display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/nu
 [ -n "$wt" ] && git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 2
 
 CNT_DIR="$GL_CACHE/autofix"; mkdir -p "$CNT_DIR" 2>/dev/null || true
-cnt_file="$CNT_DIR/$(printf '%s' "$sess" | tr -c 'A-Za-z0-9._-' '_')"
+cnt_file="$CNT_DIR/$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_')"   # per-id: shared cap across Stop + sweep
 
 # Gate: skip only what GitHub CONFIRMS clean. It computes mergeability
 # asynchronously, so a real conflict often shows as UNKNOWN (not CONFLICTING) —

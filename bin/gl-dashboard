@@ -555,6 +555,7 @@ def main(stdscr):
     block_outs = {}      # id -> output.json payload
     block_specs = {}     # id -> spec.json
     last_block_sweep = 0.0
+    last_autofix_sweep = 0.0
     pending = None       # id whose preview is waiting to settle
     pending_ts = 0.0
     status_line = ""
@@ -594,6 +595,11 @@ def main(stdscr):
                     if b:
                         run_bg([os.path.join(BIN, "gl-block"), b])
                 last_block_sweep = now
+            # Autofix sweep: pick up idle+conflicting sessions the Stop hook
+            # missed (gl-autofix --sweep skips busy sessions and non-conflicts).
+            if now - last_autofix_sweep >= 90:
+                run_bg([os.path.join(BIN, "gl-autofix"), "--sweep"])
+                last_autofix_sweep = now
 
         tickets_view = order_tickets(tickets, live)   # live sessions on top
         items = build_items(tickets_view, agents)
