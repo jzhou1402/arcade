@@ -43,9 +43,15 @@ wt="$("$TMUX_BIN" display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/nu
 CNT_DIR="$GL_CACHE/autofix"; mkdir -p "$CNT_DIR" 2>/dev/null || true
 cnt_file="$CNT_DIR/$(printf '%s' "$sess" | tr -c 'A-Za-z0-9._-' '_')"
 
-# Cheap gate: only look closer when GitHub says this PR is CONFLICTING.
-[ "$(gl_ticket_field "$id" .pr.mergeable 2>/dev/null || true)" = "CONFLICTING" ] || {
-  rm -f "$cnt_file" 2>/dev/null || true     # reset the loop counter — nothing to fix
+# Gate: skip only what GitHub CONFIRMS clean. It computes mergeability
+# asynchronously, so a real conflict often shows as UNKNOWN (not CONFLICTING) —
+# especially right after a push — and the authoritative check is the live
+# merge-tree below. Require an actual PR so autofix never force-pushes a branch
+# that isn't up for review.
+prnum="$(gl_ticket_field "$id" .pr.number 2>/dev/null || true)"
+{ [ -n "$prnum" ] && [ "$prnum" != "null" ]; } || { rm -f "$cnt_file" 2>/dev/null || true; exit 1; }
+[ "$(gl_ticket_field "$id" .pr.mergeable 2>/dev/null || true)" = "MERGEABLE" ] && {
+  rm -f "$cnt_file" 2>/dev/null || true     # GitHub confirms clean — nothing to fix
   exit 1
 }
 
