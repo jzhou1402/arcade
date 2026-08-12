@@ -360,9 +360,11 @@ def block_body_lines(o, width):
     return lines or ["(empty)"]
 
 
-def draw_card(stdscr, top, x0, height, cw, heading, lines, accent, editable=True):
-    """Draw one grid cell: a heading rule (with an ✎ edit affordance in the
-    top-right corner) and word-wrapped body, clipped to the cell."""
+def draw_card(stdscr, top, x0, height, cw, heading, lines, accent, offset=0, editable=True):
+    """Draw one grid cell: a heading rule (with an [edit] affordance in the
+    top-right corner) and word-wrapped body, scrolled by `offset` lines within
+    the fixed box. Content that overflows is reached by the mouse wheel; markers
+    show there's more above/below."""
     if height < 2 or cw < 8:
         return
     inner = cw - 1                                        # gutter between columns
@@ -376,10 +378,19 @@ def draw_card(stdscr, top, x0, height, cw, heading, lines, accent, editable=True
     except curses.error:
         pass
     avail = height - 1
-    show = lines[:avail]
-    if len(lines) > avail and avail > 0:
-        show = lines[:avail - 1] + ["…"]
-    for i, ln in enumerate(show):
+    total = len(lines)
+    if avail <= 0:
+        return
+    if total <= avail:
+        window = lines[:avail]
+    else:
+        off = max(0, min(offset, total - avail))
+        window = list(lines[off:off + avail])
+        if off > 0:                                      # more scrolled off the top
+            window[0] = "  ^ more above"
+        if off + avail < total:                          # more below
+            window[-1] = "  v %d more" % (total - off - avail)
+    for i, ln in enumerate(window):
         try:
             stdscr.addnstr(top + 1 + i, x0 + 1, ln[:inner - 1], inner - 1)
         except curses.error:
@@ -412,7 +423,7 @@ def cell_rects(cards_top, cards_h, w):
     ]
 
 
-def draw_grid(stdscr, cards_top, cards_h, w, slots, outs, specs):
+def draw_grid(stdscr, cards_top, cards_h, w, slots, outs, specs, scroll):
     if cards_h < 4:
         return
     for i, (top, x0, ch, cw) in enumerate(cell_rects(cards_top, cards_h, w)):
@@ -423,10 +434,11 @@ def draw_grid(stdscr, cards_top, cards_h, w, slots, outs, specs):
         o = outs.get(bid)
         heading = (o or {}).get("title") or (specs.get(bid) or {}).get("title") or bid
         accent = 6 if i % 2 == 0 else 5
-        draw_card(stdscr, top, x0, ch, cw, heading, block_body_lines(o, cw - 3), accent)
+        draw_card(stdscr, top, x0, ch, cw, heading, block_body_lines(o, cw - 3), accent,
+                  offset=scroll.get(bid, 0))
 
 
-def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents, slots, outs, specs, unread):
+def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents, slots, outs, specs, unread, scroll):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     title = "  Linear — my active tickets"
@@ -488,7 +500,7 @@ def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents, 
             x = add_seg(stdscr, y, x, name, max(10, maxw - x), 0, sel, maxw)
 
     if cards_h > 0:
-        draw_grid(stdscr, body_top + list_h, cards_h, w, slots, outs, specs)
+        draw_grid(stdscr, body_top + list_h, cards_h, w, slots, outs, specs, scroll)
 
     split = f" · ▶ {shown}" if shown else ""
     footer = (" ↑/↓ move · ⏎ open · y split" + split +
@@ -517,8 +529,11 @@ def main(stdscr):
     # (Terminals can't report macOS Cmd, so the gesture is double-click, not
     # Cmd-click.) mouseinterval > 0 is required for double-click detection.
     try:
-        curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
-                         | curses.BUTTON1_PRESSED)
+        mask = (curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
+                | curses.BUTTON1_PRESSED)
+        mask |= getattr(curses, "BUTTON4_PRESSED", 0)   # wheel up   (scroll blocks)
+        mask |= getattr(curses, "BUTTON5_PRESSED", 0)   # wheel down
+        curses.mousemask(mask)
         curses.mouseinterval(250)
     except curses.error:
         pass
@@ -554,6 +569,7 @@ def main(stdscr):
     slots = []           # 2x2 grid block ids, loaded each poll
     block_outs = {}      # id -> output.json payload
     block_specs = {}     # id -> spec.json
+    block_scroll = {}    # id -> wheel scroll offset (lines) within its fixed box
     last_block_sweep = 0.0
     last_autofix_sweep = 0.0
     pending = None       # id whose preview is waiting to settle
@@ -644,7 +660,7 @@ def main(stdscr):
             pending = None
 
         draw(stdscr, rows, idx, top, live, status_line, shown, len(tickets), len(agents),
-             slots, block_outs, block_specs, unread)
+             slots, block_outs, block_specs, unread, block_scroll)
         status_line = ""
 
         try:
@@ -684,13 +700,21 @@ def main(stdscr):
             mh, mw = stdscr.getmaxyx()
             _bt, l_h, c_h = compute_layout(mh, len(rows))
             cards_top = 2 + l_h
+            wheel = bstate & (getattr(curses, "BUTTON4_PRESSED", 0)
+                              | getattr(curses, "BUTTON5_PRESSED", 0))
             if c_h > 0 and my >= cards_top:
-                # A click in the 2x2 block grid: the [edit] title bar (or anywhere
-                # in an empty cell) opens that slot's authoring session.
+                # In the 2x2 block grid: wheel scrolls a block's content within its
+                # fixed box; the [edit] title bar (or anywhere in an empty cell)
+                # opens that slot's authoring session.
                 for si, (cy, cx, ch, cwid) in enumerate(cell_rects(cards_top, c_h, mw)):
                     if cy <= my < cy + ch and cx <= mx < cx + cwid:
-                        empty = not (slots[si] if si < len(slots) else None)
-                        if empty or my == cy:
+                        bid = slots[si] if si < len(slots) else None
+                        if wheel and bid:
+                            n_lines = len(block_body_lines(block_outs.get(bid), cwid - 3))
+                            maxoff = max(0, n_lines - (ch - 1))
+                            step = -3 if (bstate & getattr(curses, "BUTTON4_PRESSED", 0)) else 3
+                            block_scroll[bid] = max(0, min(block_scroll.get(bid, 0) + step, maxoff))
+                        elif not wheel and (bid is None or my == cy):
                             run_bg([os.path.join(BIN, "gl-block-edit"), str(si)])
                             status_line = f" configuring block {si + 1} — chat on the right "
                         break
