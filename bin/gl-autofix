@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Auto-resolve a ticket's merge conflict by handing it to its already-idle claude
+# session. Called by the Stop hook (gl-notify) when a session finishes a turn: if
+# the ticket's PR conflicts with the base branch, paste a "fix conflict" directive
+# into that session's pane so it rebases, resolves, verifies, and force-pushes.
+#
+# Capped at 5 attempts per session to prevent loops. Only acts on real tickets
+# (not free agents) with a git worktree.
+#
+#   gl-autofix <id> [session_id]
+# exit 0 = pasted a fix into the session   3 = gave up (hit the 5-attempt cap)
+#      1 = no conflict (nothing to do)      2 = not applicable (no session/worktree)
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+[ -n "$TMUX_BIN" ] || exit 1
+
+# Sweep mode: catch sessions already idle + conflicting. The Stop hook only fires
+# at turn-end, so a session sitting idle when its PR went conflicting is never
+# picked up otherwise. For each standalone live ticket window that is idle (not
+# mid-turn), delegate to the single-id path.
+if [ "${1:-}" = "--sweep" ]; then
+  [ -f "$GL_CACHE/autofix-off" ] && exit 0
+  gl_session_exists || exit 0
+  "$TMUX_BIN" list-windows -t "$GL_SESSION" -F '#{window_index}|#{@ticket}|#{@cockpit}' 2>/dev/null \
+    | awk -F'|' '$3 != "1" && $2 != "" { print $1"|"$2 }' \
+    | while IFS='|' read -r _win tid; do
+        case "$tid" in agent-*|block*) continue;; esac
+        p="$("$TMUX_BIN" list-panes -t "$GL_SESSION:$_win" -F '#{pane_id}' 2>/dev/null | head -1)"
+        [ -n "$p" ] || continue
+        # Never paste into a session mid-turn.
+        "$TMUX_BIN" capture-pane -t "$p" -p 2>/dev/null | grep -q "esc to interrupt" && continue
+        "$0" "$tid" >/dev/null 2>&1 || true
+      done
+  exit 0
+fi
+
+id="${1:-}"; [ -n "$id" ] || exit 2
+sess="${2:-$id}"
+# Kill-switch: `touch $GL_CACHE/autofix-off` disables autofix instantly (no code
+# edit, no restart) if a resolution ever misbehaves.
+[ -f "$GL_CACHE/autofix-off" ] && exit 1
+gl_session_exists || exit 2
+gl_is_free "$id" && exit 2                  # free agents have no branch to rebase
+
+# Find the pane running this id's idle claude (standalone window or cockpit) and
+# operate in ITS working directory. That's authoritative: the convention path
+# gl_worktree() can differ from where the session actually runs, and a git
+# worktree's .git is a FILE not a dir (so a `-d .git` test wrongly rejects it).
+pane=""
+cockpit="$(gl_cockpit_window || true)"
+if [ -n "$cockpit" ] && [ "$(gl_shown_ticket "$cockpit")" = "$id" ] && [ "$(gl_shown_kind "$cockpit")" = "claude" ]; then
+  pane="$(gl_cockpit_claude_pane "$cockpit")"
+else
+  w="$(gl_window_for "$id" || true)"
+  [ -n "$w" ] && pane="$("$TMUX_BIN" list-panes -t "$GL_SESSION:$w" -F '#{pane_id}' 2>/dev/null | head -1)"
+fi
+[ -n "$pane" ] || exit 2
+
+wt="$("$TMUX_BIN" display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)"
+[ -n "$wt" ] && git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 2
+
+CNT_DIR="$GL_CACHE/autofix"; mkdir -p "$CNT_DIR" 2>/dev/null || true
+cnt_file="$CNT_DIR/$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_')"   # per-id: shared cap across Stop + sweep
+
+# Gate: skip only what GitHub CONFIRMS clean. It computes mergeability
+# asynchronously, so a real conflict often shows as UNKNOWN (not CONFLICTING) —
+# especially right after a push — and the authoritative check is the live
+# merge-tree below. Require an actual PR so autofix never force-pushes a branch
+# that isn't up for review.
+prnum="$(gl_ticket_field "$id" .pr.number 2>/dev/null || true)"
+{ [ -n "$prnum" ] && [ "$prnum" != "null" ]; } || { rm -f "$cnt_file" 2>/dev/null || true; exit 1; }
+[ "$(gl_ticket_field "$id" .pr.mergeable 2>/dev/null || true)" = "MERGEABLE" ] && {
+  rm -f "$cnt_file" 2>/dev/null || true     # GitHub confirms clean — nothing to fix
+  exit 1
+}
+
+# Confirm against live refs (the cache lags a just-pushed fix): merge-tree is a
+# pure computation, no working-tree change. rc 0 = clean, 1 = conflicts.
+git -C "$wt" fetch -q origin "$GL_BASE_BRANCH" 2>/dev/null || true
+# NB: `|| rc=$?` is required — merge-tree returns 1 on conflict, which under
+# `set -e` would otherwise abort the script on the very case we want to act on.
+rc=0
+git -C "$wt" merge-tree --write-tree HEAD "origin/$GL_BASE_BRANCH" >/dev/null 2>&1 || rc=$?
+if [ "$rc" = "0" ]; then
+  rm -f "$cnt_file" 2>/dev/null || true     # already clean (e.g. fix landed)
+  exit 1
+fi
+# rc 1 = real conflict; rc >1 = merge-tree error, fall back to trusting the cache.
+
+# Loop guard: at most 5 autofix pastes per session.
+n="$(cat "$cnt_file" 2>/dev/null || echo 0)"; case "$n" in ''|*[!0-9]*) n=0;; esac
+[ "$n" -ge 5 ] && exit 3
+
+printf '%s' "$((n + 1))" > "$cnt_file"
+
+PASTE="fix conflict: rebase this branch onto origin/${GL_BASE_BRANCH}, resolve every conflict faithfully (preserve both sides' intent), then run the typecheck and build. If they pass, push with 'git push --force-with-lease'. If they fail, stop and tell me. Do not touch anything unrelated."
+
+# Fire slightly deferred + detached so claude is back at its idle prompt when the
+# text lands, and so it outlives this hook invocation.
+( sleep 2
+  "$TMUX_BIN" send-keys -t "$pane" -l "$PASTE" 2>/dev/null
+  "$TMUX_BIN" send-keys -t "$pane" Enter 2>/dev/null
+) >/dev/null 2>&1 & disown 2>/dev/null || true
+
+gl_log "autofix: pasted fix into $id (attempt $((n + 1))/5)"
+exit 0

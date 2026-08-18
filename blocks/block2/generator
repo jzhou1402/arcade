@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# scaffold — the configure session replaces this
+printf '%s' '{"title":"New block","mode":"","elements":[{"type":"text","text":"Not configured yet. Describe what you want in the chat on the right and I will build this block."}]}'
