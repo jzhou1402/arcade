@@ -730,8 +730,14 @@ def main(stdscr):
                             status_line = f" opening {it['id']} in Linear "
                         else:
                             status_line = " no Linear URL for that row "
-                    else:                    # single click: select (+ preview via tail)
+                    else:                    # single click: select, mark read (+ preview)
                         idx = item_idx; moved = True
+                        rid = items[item_idx]["id"]
+                        unread.discard(rid)              # instant: blue -> green
+                        try:
+                            os.remove(os.path.join(UNREAD_DIR, rid))
+                        except OSError:
+                            pass
         elif c in (curses.KEY_UP, ord("k")):
             idx = max(0, idx - 1); moved = True
         elif c in (curses.KEY_DOWN, ord("j")):
