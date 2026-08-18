@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Slack @mention watcher.
+
+Polls Slack for messages that @-mention me, fires a macOS notification for each
+one I haven't seen before, and prints the dashboard card. Read-only: the only
+Slack scope needed is `search:read`.
+
+Token (first hit wins, all read-only):
+  1. $SLACK_USER_TOKEN
+  2. macOS keychain: `security find-generic-password -s gl-slack-token -w`
+  3. $GL_CONFIG_DIR/.slack_token  (or ./.slack_token in this block dir)
+
+Seen-state lives in ~/.cache/ghostty-linear/blocks/slack-mentions.json so the
+repo stays clean. The first run seeds that file WITHOUT notifying — otherwise it
+would fire a burst for mentions that are already old news.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = "https://slack.com/api/"
+TIMEOUT = 12
+MAX_SHOWN = 4          # mention lines on the card (quarter-screen budget)
+MAX_NOTIFY = 3         # notifications per run; the rest collapse into one "+N more"
+LOOKBACK_DAYS = 7      # how far back a mention still counts as interesting
+NEW_WINDOW = 3600      # a mention reads as "new" on the card this long after first sight
+SEEN_KEEP = 300        # cap on the seen-ledger so it can't grow forever
+
+CACHE = os.path.expanduser("~/.cache/ghostty-linear/blocks")
+STATE = os.path.join(CACHE, "slack-mentions.json")
+CONFIG_DIR = os.environ.get("GL_CONFIG_DIR", os.path.expanduser("~/.config/ghostty-linear"))
+TITLE = "Slack Mentions"
+
+
+# ---------------------------------------------------------------- presentation
+
+def card(elements, mode="compiler"):
+    json.dump({"title": TITLE, "mode": mode, "elements": elements}, sys.stdout)
+    sys.exit(0)
+
+
+def setup_card(detail):
+    """No usable token yet — tell me exactly how to fix it, on the card."""
+    card([
+        {"type": "text", "text": detail},
+        {"type": "section", "label": "Setup",
+         "text": "Slack user token (scope search:read), then store it in the keychain."},
+        {"type": "list", "items": [
+            "api.slack.com/apps -> your app -> OAuth & Permissions",
+            "User Token Scopes: add search:read -> Install to Workspace",
+            "security add-generic-password -a $USER -s gl-slack-token -w xoxp-...",
+        ]},
+    ])
+
+
+def ago(ts):
+    d = max(0, int(time.time() - float(ts)))
+    if d < 60:
+        return f"{d}s"
+    if d < 3600:
+        return f"{d // 60}m"
+    if d < 86400:
+        return f"{d // 3600}h"
+    return f"{d // 86400}d"
+
+
+def place(m):
+    """Where a match happened: '#channel', or 'DM' when there's no channel name."""
+    ch = m.get("channel", {}) or {}
+    name = ch.get("name")
+    if not name or ch.get("is_im") or ch.get("is_mpim"):
+        return "DM"
+    return "#" + name
+
+
+def squash(text, limit=52, me=None):
+    """One-line, mention-tokens made readable, clipped for a narrow card."""
+    text = re.sub(r"<@[UW][A-Z0-9]+\|([^>]+)>", r"@\1", text)
+    if me:                                     # only MY id is "@me"
+        text = re.sub(r"<@" + re.escape(me) + r">", "@me", text)
+    text = re.sub(r"<@[UW][A-Z0-9]+>", "@user", text)
+    text = re.sub(r"<#C[A-Z0-9]+\|([^>]+)>", r"#\1", text)
+    text = re.sub(r"<!(here|channel|everyone)>", r"@\1", text)
+    text = re.sub(r"<([^|>]+)\|([^>]+)>", r"\2", text)   # link with label
+    text = re.sub(r"<(https?://[^>]+)>", "link", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[: limit - 1] + "…" if len(text) > limit else text
+
+
+# ---------------------------------------------------------------------- slack
+
+def slack(token, method, **params):
+    url = API + method + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        return json.load(r)
+
+
+def read_token():
+    tok = (os.environ.get("SLACK_USER_TOKEN") or "").strip()
+    if tok:
+        return tok, None
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "gl-slack-token", "-w"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip(), None
+    except Exception:
+        pass
+    for path in (os.path.join(CONFIG_DIR, ".slack_token"), ".slack_token"):
+        try:
+            with open(path) as f:
+                tok = f.read().strip()
+            if tok:
+                return tok, None
+        except OSError:
+            continue
+    return None, "No Slack token found."
+
+
+def find_mentions(token, uid, handle):
+    """Slack has no mentions endpoint, so search for the mention token itself.
+
+    `<@UID>` is how a mention is stored, and it's the precise query; `@handle`
+    catches workspaces where search doesn't match the raw form. Run both and
+    merge -- two tier-2 calls per poll is well inside the rate limit.
+    """
+    hits, errors = {}, []
+    queries = [f"<@{uid}>"]
+    if handle:
+        queries.append("@" + handle)
+    for q in queries:
+        try:
+            res = slack(token, "search.messages", query=q, count=20, sort="timestamp")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            errors.append(str(e)[:60])
+            continue
+        if not res.get("ok"):
+            errors.append(res.get("error", "unknown"))
+            continue
+        for m in res.get("messages", {}).get("matches", []):
+            ts = m.get("ts")
+            if ts:
+                hits.setdefault(ts, m)
+    return hits, errors
+
+
+def notify(title, body):
+    body = body.replace("\\", "").replace('"', "'")
+    title = title.replace("\\", "").replace('"', "'")
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{body}" with title "{title}" sound name "Tink"'],
+            capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------------ main
+
+def main():
+    token, err = read_token()
+    if not token:
+        setup_card(err)
+
+    try:
+        me = slack(token, "auth.test")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        card([{"type": "text", "text": "Slack unreachable."},
+              {"type": "section", "label": "Error", "text": str(e)[:120]}])
+    if not me.get("ok"):
+        e = me.get("error", "unknown")
+        if e in ("invalid_auth", "not_authed", "token_revoked", "account_inactive"):
+            setup_card(f"Slack rejected the token ({e}).")
+        card([{"type": "text", "text": "Slack auth failed."},
+              {"type": "section", "label": "Error", "text": e}])
+
+    uid = me.get("user_id", "")
+    handle = me.get("user", "")
+    hits, errors = find_mentions(token, uid, handle)
+
+    if not hits and errors:
+        if any("missing_scope" in e or "not_allowed_token_type" in e for e in errors):
+            setup_card("Token is missing the search:read scope.")
+        card([{"type": "text", "text": "Slack search failed."},
+              {"type": "section", "label": "Error", "text": ", ".join(errors)[:120]}])
+
+    cutoff = time.time() - LOOKBACK_DAYS * 86400
+    mentions = sorted(
+        (m for ts, m in hits.items() if float(ts) >= cutoff),
+        key=lambda m: float(m["ts"]), reverse=True)
+
+    # Diff against the seen-ledger: {mention_ts: epoch when this run first saw it}.
+    # Keying on first-seen rather than "arrived since the last poll" is what keeps
+    # the card readable -- a poll-to-poll diff is empty 4 refreshes out of 5, so the
+    # count would blink to 0 moments after the notification fired.
+    try:
+        with open(STATE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    raw = state.get("seen")
+    first_run = raw is None
+    seen = {t: float(v) for t, v in raw.items()} if isinstance(raw, dict) else {
+        t: 0.0 for t in (raw or [])}   # migrate the old list-of-ts format
+
+    now = time.time()
+    fresh = [m for m in mentions if m["ts"] not in seen]
+
+    # A missing ledger means first run: seed it quietly, or we'd fire a burst of
+    # notifications for mentions that are already old news.
+    if fresh and not first_run:
+        for m in fresh[:MAX_NOTIFY]:
+            who = m.get("username") or m.get("user") or "someone"
+            where = place(m)
+            head = f"@{who} (DM)" if where == "DM" else f"@{who} in {where}"
+            notify(head, squash(m.get("text", ""), 90, me=uid))
+        if len(fresh) > MAX_NOTIFY:
+            notify("Slack", f"+{len(fresh) - MAX_NOTIFY} more mentions")
+
+    # Backdate the seeding run so nothing counts as "new" on the card either.
+    stamp = 0.0 if first_run else now
+    for m in fresh:
+        seen[m["ts"]] = stamp
+    for t in sorted(seen, key=float, reverse=True)[SEEN_KEEP:]:
+        del seen[t]
+
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"seen": seen, "checked": int(now)}, f)
+    os.replace(tmp, STATE)
+
+    # ------------------------------------------------------------------ render
+    day = now - 86400
+    today = [m for m in mentions if float(m["ts"]) >= day]
+    # "New" == first seen within NEW_WINDOW, so the badge survives a few refreshes
+    # instead of vanishing on the next poll.
+    new = [m for m in mentions if now - seen.get(m["ts"], 0.0) < NEW_WINDOW]
+    elements = [{
+        "type": "metric",
+        "label": f"New (last {NEW_WINDOW // 3600}h)",
+        "value": str(len(new)),
+        "sub": f"{len(today)} in 24h · {len(mentions)} in {LOOKBACK_DAYS}d",
+    }]
+
+    if not mentions:
+        elements.append({"type": "text", "text": f"No @mentions in {LOOKBACK_DAYS} days. Quiet."})
+        card(elements)
+
+    # Newest gets quoted in full; the rest are one-liners. Quoting the newest and
+    # also listing it would spend two of ~10 lines on the same message.
+    new_ts = {m["ts"] for m in new}
+    top = mentions[0]
+    elements.append({
+        "type": "quote",
+        "text": squash(top.get("text", ""), 110, me=uid),
+        "cite": f"{'● ' if top['ts'] in new_ts else ''}{top.get('username') or '?'} · "
+                f"{place(top)} · {ago(top['ts'])} ago",
+    })
+
+    items = []
+    for m in mentions[1:MAX_SHOWN]:
+        flag = "● " if m["ts"] in new_ts else ""
+        items.append(f"{flag}{place(m)} · {m.get('username') or '?'} · "
+                     f"{ago(m['ts'])} — {squash(m.get('text', ''), me=uid)}")
+    if items:
+        elements.append({"type": "list", "items": items})
+    if len(mentions) > MAX_SHOWN:
+        elements.append({"type": "text", "text": f"+{len(mentions) - MAX_SHOWN} older"})
+    card(elements)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:  # never emit a broken payload
+        card([{"type": "text", "text": "Mention check failed."},
+              {"type": "section", "label": "Error", "text": f"{type(e).__name__}: {e}"[:120]}])
