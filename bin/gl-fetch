@@ -119,6 +119,19 @@ fi
 mv "$tmp" "$GL_TICKETS"
 gl_log "Wrote $(jq 'length' "$GL_TICKETS") tickets to $GL_TICKETS"
 
+# Auto-close tickets to match their PR: merged -> Done, closed -> Canceled.
+# Backgrounded so the (already slow) fetch never blocks on Linear mutations;
+# gl-close is idempotent (checks live state) and honours $GL_CACHE/close-off.
+if [ ! -f "$GL_CACHE/close-off" ]; then
+  ( jq -r '.[] | select(.pr.state == "MERGED" or .pr.state == "CLOSED") | "\(.id)|\(.pr.state)"' "$GL_TICKETS" 2>/dev/null \
+    | while IFS='|' read -r _tid _ps; do
+        case "$_ps" in
+          MERGED) "$DIR/gl-close" "$_tid" merged || true ;;
+          CLOSED) "$DIR/gl-close" "$_tid" closed || true ;;
+        esac
+      done ) >/dev/null 2>&1 &
+fi
+
 # Reconcile running sessions against the freshly-written active set: any live
 # ticket session Linear no longer pulls (merged/closed/deprioritised) has its
 # dev servers + claude killed, its window closed, and its worktree removed.

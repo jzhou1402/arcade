@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Close a Linear ticket to match its PR:
+#   gl-close <IDENTIFIER> merged   -> the team's completed state (Done)
+#   gl-close <IDENTIFIER> closed   -> the team's canceled state (Canceled)
+# No-op if the ticket is already completed/canceled, or if the kill-switch
+# `$GL_CACHE/close-off` exists. Queries live Linear state, so it's idempotent
+# (re-running after a close does nothing).
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+id="${1:-}"; kind="${2:-merged}"
+[ -n "$id" ] || { gl_log "gl-close: no id"; exit 1; }
+[ -f "$GL_CACHE/close-off" ] && exit 0
+case "$kind" in
+  merged) want="completed" ;;
+  closed) want="canceled" ;;
+  *) gl_log "gl-close: kind must be merged|closed"; exit 1 ;;
+esac
+tok="$(gl_token)"; [ -n "$tok" ] || { gl_log "gl-close: no Linear token"; exit 1; }
+
+_gql() {
+  curl -s --max-time 20 https://api.linear.app/graphql \
+    -H "Authorization: $tok" -H "Content-Type: application/json" -d "$1"
+}
+
+# Look up the issue's internal id, current state type, and its team's states.
+q="$(jq -n --arg id "$id" '{query:"query($id:String!){ issue(id:$id){ id state{ type } team{ states{ nodes{ id name type position } } } } }", variables:{id:$id}}')"
+resp="$(_gql "$q")"
+uuid="$(printf '%s' "$resp" | jq -r '.data.issue.id // empty')"
+cur="$(printf '%s'  "$resp" | jq -r '.data.issue.state.type // empty')"
+[ -n "$uuid" ] || { gl_log "gl-close: $id not found ($(printf '%s' "$resp" | jq -c '.errors // "?"'))"; exit 1; }
+case "$cur" in completed|canceled) exit 0 ;; esac        # already closed — nothing to do
+
+# Target state: prefer the canonical "Done"/"Canceled" name, else the
+# lowest-position state of the wanted type.
+sid="$(printf '%s' "$resp" | jq -r --arg t "$want" '
+  [ .data.issue.team.states.nodes[] | select(.type==$t) ] as $s
+  | ( [ $s[] | select(.name=="Done" or .name=="Canceled") ] + ($s | sort_by(.position)) )[0].id // empty')"
+[ -n "$sid" ] || { gl_log "gl-close: no $want state for $id's team"; exit 1; }
+
+m="$(jq -n --arg id "$uuid" --arg sid "$sid" '{query:"mutation($id:String!,$sid:String!){ issueUpdate(id:$id, input:{stateId:$sid}){ success issue{ identifier state{ name } } } }", variables:{id:$id, sid:$sid}}')"
+out="$(_gql "$m")"
+if [ "$(printf '%s' "$out" | jq -r '.data.issueUpdate.success // false')" = "true" ]; then
+  gl_log "gl-close: $id -> $(printf '%s' "$out" | jq -r '.data.issueUpdate.issue.state.name')"
+else
+  gl_log "gl-close: $id failed: $(printf '%s' "$out" | jq -c '.errors // .')"
+  exit 1
+fi
