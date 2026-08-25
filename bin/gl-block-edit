@@ -51,11 +51,25 @@ if [ -n "$(gl_window_for "$id" 2>/dev/null || true)" ]; then
   exit 0
 fi
 
-# Mark it as being configured so the background sweep leaves it alone.
-tmp="$(mktemp)"; jq '.status="configuring"' "$bdir/spec.json" > "$tmp" 2>/dev/null && mv "$tmp" "$bdir/spec.json" || rm -f "$tmp"
-
+action="$(jq -r '.action // "config"' "$bdir/spec.json" 2>/dev/null || echo config)"
 instruction="$(jq -r '.instruction // ""' "$bdir/spec.json" 2>/dev/null || true)"
 claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
+
+if [ "$action" = "report" ]; then
+  # Report-issue block: open a session that files a GitHub issue to arcade —
+  # this block is used, not configured, so don't touch its spec/generator.
+  read -r -d '' SEED <<'EOF' || true
+You are helping me file a GitHub issue about the "arcade" dashboard tool — the ghostty-linear tmux dashboard, repo jzhou1402/arcade.
+
+Ask me what I want to report: a bug (what happened, steps to reproduce, what I expected) or a feature/idea. Keep it to a couple of quick questions, then draft a clear title and a concise body.
+
+Create the issue in the jzhou1402/arcade repository — prefer the GitHub MCP (create issue); if it isn't available, use `gh issue create -R jzhou1402/arcade -t "<title>" -b "<body>"`. Add a "bug" or "enhancement" label if one exists. When it's posted, show me the issue number and URL.
+
+Start by asking what I'd like to report.
+EOF
+else
+# Mark it as being configured so the background sweep leaves it alone.
+tmp="$(mktemp)"; jq '.status="configuring"' "$bdir/spec.json" > "$tmp" 2>/dev/null && mv "$tmp" "$bdir/spec.json" || rm -f "$tmp"
 
 read -r -d '' SEED <<EOF || true
 You are configuring a "block" for my ghostty-linear arcade dashboard. You are running inside this block's directory (block id: ${id}). The dashboard shows blocks in a 2x2 grid; this one occupies a quarter-screen card, so keep rendered text compact.
@@ -81,6 +95,7 @@ Do this:
 
 When status is "active" and output.json is ready, the dashboard picks it up automatically (within ~30s). Then tell me it's live. Start by greeting me and asking what I want (or confirming the existing instruction).
 EOF
+fi
 
 launch="$(printf '%q ' "$claude_bin") --dangerously-skip-permissions $(printf '%q' "$SEED"); exec $(printf '%q' "${SHELL:-/bin/zsh}") -l"
 win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "edit $id" -c "$bdir" -P -F '#{window_id}' "$launch")"

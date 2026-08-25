@@ -360,7 +360,7 @@ def block_body_lines(o, width):
     return lines or ["(empty)"]
 
 
-def draw_card(stdscr, top, x0, height, cw, heading, lines, accent, offset=0, editable=True):
+def draw_card(stdscr, top, x0, height, cw, heading, lines, accent, offset=0, editable=True, edit_label="[edit]"):
     """Draw one grid cell: a heading rule (with an [edit] affordance in the
     top-right corner) and word-wrapped body, scrolled by `offset` lines within
     the fixed box. Content that overflows is reached by the mouse wheel; markers
@@ -368,7 +368,7 @@ def draw_card(stdscr, top, x0, height, cw, heading, lines, accent, offset=0, edi
     if height < 2 or cw < 8:
         return
     inner = cw - 1                                        # gutter between columns
-    edit = " [edit]" if editable else ""                 # ASCII so every font shows it
+    edit = (" " + edit_label) if editable else ""        # ASCII so every font shows it
     rule = ("── " + heading + " ").ljust(max(0, inner - len(edit)), "─")[:max(0, inner - len(edit))] + edit
     attr = curses.A_BOLD | (curses.color_pair(accent) if accent else 0)
     try:
@@ -434,8 +434,9 @@ def draw_grid(stdscr, cards_top, cards_h, w, slots, outs, specs, scroll):
         o = outs.get(bid)
         heading = (o or {}).get("title") or (specs.get(bid) or {}).get("title") or bid
         accent = 6 if i % 2 == 0 else 5
+        elabel = "[report]" if (specs.get(bid) or {}).get("action") == "report" else "[edit]"
         draw_card(stdscr, top, x0, ch, cw, heading, block_body_lines(o, cw - 3), accent,
-                  offset=scroll.get(bid, 0))
+                  offset=scroll.get(bid, 0), edit_label=elabel)
 
 
 def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents, slots, outs, specs, unread, scroll):

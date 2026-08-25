@@ -1,0 +1,9 @@
+{
+  "id": "report-issue",
+  "title": "Report an Issue",
+  "cadence": "30m",
+  "mode": "compiler",
+  "action": "report",
+  "instruction": "File a bug or feature request about the arcade dashboard tool to jzhou1402/arcade.",
+  "status": "active"
+}

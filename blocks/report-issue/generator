@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Report Issue block: shows open issues in the arcade repo; tapping [report] on
+# the card opens a claude session that files a new one (see gl-block-edit's
+# action=report path). Compiler generator — just `gh issue list`.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../bin/gl-lib.sh
+. "$DIR/../../bin/gl-lib.sh"
+
+REPO="jzhou1402/arcade"
+issues="$(gh issue list -R "$REPO" --state open --limit 6 --json number,title 2>/dev/null || printf '[]')"
+printf '%s' "$issues" | jq -e 'type == "array"' >/dev/null 2>&1 || issues='[]'
+
+printf '%s' "$issues" | jq --arg repo "$REPO" '{
+  title: "Report an Issue",
+  mode: "compiler",
+  elements: (
+    [ { type: "text", text: ("Tap [report] to file a bug or idea — I will post it to " + $repo + ".") } ]
+    + ( if length > 0
+        then [ { type: "text", text: "Open issues:" },
+               { type: "list", items: [ .[] | ("#\(.number) " + (.title | .[0:56])) ] } ]
+        else [ { type: "text", text: "No open issues right now." } ] end )
+  )
+}'
