@@ -10,7 +10,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HIST="$DIR/history"
 [ -d "$GL_REPO/.git" ] || { gl_log "design: no repo at $GL_REPO"; exit 1; }
 claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
-avoid="$([ -f "$HIST" ] && tail -25 "$HIST" | paste -sd';' - 2>/dev/null || true)"
+avoid="$([ -f "$HIST" ] && tail -120 "$HIST" | sort -u | paste -sd';' - 2>/dev/null || true)"
 
 read -r -d '' PROMPT <<EOF || true
 You are curating a "Design of the Day" card shown on an engineer's dashboard.
@@ -27,13 +27,16 @@ Do NOT repeat any of these recently-featured topics: ${avoid:-none}.
 
 Respond with ONLY a single JSON object (no prose, no fences) with keys:
   "title":      short name of the decision, <= 60 chars
-  "decision":   what Hazel actually does, 2-3 sentences
-  "convention": the mainstream alternative it departs from, 1-2 sentences
-  "rationale":  why it was designed this way here, grounded in the repo, 2-4 sentences
+  "decision":   what Hazel actually does, <= 2 sentences
+  "convention": the mainstream alternative it departs from, 1 sentence
+  "rationale":  why it was designed this way here, grounded in the repo, <= 2 sentences
   "verdict":    a candid "would a senior engineer building this from scratch make
-                the same call?" reflection, tradeoffs + when it would NOT apply, 2-4 sentences
-  "refs":       array of up to 3 real repo file paths that evidence this
-Keep the combined prose under ~1400 characters.
+                the same call?" — the tradeoff and when it would NOT apply, <= 2 sentences
+  "refs":       array of up to 2 real repo file paths that evidence this
+
+HARD LIMIT: decision+convention+rationale+verdict combined must be under 700
+characters. This is a quarter-screen card — every sentence must earn its place.
+Cut hedging and restatement, keep the specifics (real identifiers, real paths).
 EOF
 
 raw="$(cd "$GL_REPO" && "$claude_bin" -p --output-format json --dangerously-skip-permissions "$PROMPT" 2>/dev/null || true)"
@@ -63,5 +66,5 @@ printf '%s' "$d" | jq '{
     {type:"section", label:"Why here",      text:.rationale},
     {type:"section", label:"From scratch?", text:.verdict}
   ] + (if ((.refs|type)=="array" and (.refs|length)>0)
-       then [{type:"text", text:("refs: " + (.refs|join(", ")))}] else [] end))
+       then [{type:"text", text:("refs: " + ([.refs[] | sub("^(apps|packages)/[^/]+/(src/)?";"")] | join(", ")))}] else [] end))
 }'

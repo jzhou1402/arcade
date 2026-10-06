@@ -17,7 +17,7 @@ done
 unset _d
 export PATH
 
-GL_VERSION="0.10.0"
+GL_VERSION="0.11.0"
 GL_CODENAME="arcade"
 
 GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
@@ -38,6 +38,10 @@ GL_BASE_BRANCH="${GL_BASE_BRANCH:-main}"
 # Where free agents (not tied to a ticket) run. The repo by default so claude
 # has code context; override with GL_AGENT_DIR.
 GL_AGENT_DIR="${GL_AGENT_DIR:-$GL_REPO}"
+
+# Which coding-agent CLI new sessions run: claude (default) or codex. A free
+# agent records the CLI it was created with, so it respawns as the same one.
+GL_AGENT_CLI="${GL_AGENT_CLI:-claude}"
 
 GL_SESSION="${GL_SESSION:-hazel}"
 GL_DASHBOARD_WINDOW="dashboard"
@@ -106,6 +110,54 @@ gl_token() {
   security find-generic-password -s "$GL_KEYCHAIN_SERVICE" -w 2>/dev/null
 }
 
+# --- Linear workflow states --------------------------------------------------
+# One GraphQL round-trip. usage: gl_linear_gql '<json request body>'
+gl_linear_gql() {
+  local tok; tok="$(gl_token)"
+  [ -n "$tok" ] || { gl_log "no Linear API key — run gl-setup"; return 1; }
+  curl -s --max-time 20 https://api.linear.app/graphql \
+    -H "Authorization: $tok" -H "Content-Type: application/json" -d "$1"
+}
+
+# The workflow states of a ticket's team, as TSV "type<TAB>name", in Linear's
+# own workflow order (Triage -> Backlog -> Todo -> In Progress -> Done ...).
+gl_issue_states() {
+  local id="$1" q resp
+  [ -n "$id" ] || { gl_log "states: no id"; return 1; }
+  q="$(jq -n --arg id "$id" '{query:"query($id:String!){ issue(id:$id){ team{ states{ nodes{ name type position } } } } }", variables:{id:$id}}')"
+  resp="$(gl_linear_gql "$q")" || return 1
+  printf '%s' "$resp" | jq -e '.data.issue.team' >/dev/null 2>&1 \
+    || { gl_log "states: $id not found ($(printf '%s' "$resp" | jq -c '.errors // "?"'))"; return 1; }
+  # Order by workflow stage first: Linear's `position` only orders within a
+  # type, so sorting on it alone interleaves (In Review after Duplicate).
+  printf '%s' "$resp" | jq -r '
+    { triage:0, backlog:1, unstarted:2, started:3, completed:4, canceled:5, duplicate:6 } as $rank
+    | .data.issue.team.states.nodes
+    | sort_by([ ($rank[.type] // 9), .position ])
+    | .[] | "\(.type)\t\(.name)"'
+}
+
+# Move a ticket to a workflow state by name (exact, case-insensitive). Prints the
+# resulting state name. Idempotent: already in that state is a successful no-op.
+gl_set_state() {
+  local id="$1" want="$2" q resp uuid cur sid m out
+  [ -n "$id" ] && [ -n "$want" ] || { gl_log "set-state: need <id> <state>"; return 1; }
+  q="$(jq -n --arg id "$id" '{query:"query($id:String!){ issue(id:$id){ id state{ name } team{ states{ nodes{ id name type } } } } }", variables:{id:$id}}')"
+  resp="$(gl_linear_gql "$q")" || return 1
+  uuid="$(printf '%s' "$resp" | jq -r '.data.issue.id // empty')"
+  cur="$(printf '%s'  "$resp" | jq -r '.data.issue.state.name // empty')"
+  [ -n "$uuid" ] || { gl_log "set-state: $id not found ($(printf '%s' "$resp" | jq -c '.errors // "?"'))"; return 1; }
+  if [ "$(gl_slug "$cur")" = "$(gl_slug "$want")" ]; then printf '%s' "$cur"; return 0; fi
+  sid="$(printf '%s' "$resp" | jq -r --arg w "$want" \
+    '[ .data.issue.team.states.nodes[] | select((.name|ascii_downcase) == ($w|ascii_downcase)) ][0].id // empty')"
+  [ -n "$sid" ] || { gl_log "set-state: $id's team has no state named \"$want\""; return 1; }
+  m="$(jq -n --arg id "$uuid" --arg sid "$sid" '{query:"mutation($id:String!,$sid:String!){ issueUpdate(id:$id, input:{stateId:$sid}){ success issue{ state{ name } } } }", variables:{id:$id, sid:$sid}}')"
+  out="$(gl_linear_gql "$m")" || return 1
+  [ "$(printf '%s' "$out" | jq -r '.data.issueUpdate.success // false')" = "true" ] \
+    || { gl_log "set-state: $id failed: $(printf '%s' "$out" | jq -c '.errors // .')"; return 1; }
+  printf '%s' "$out" | jq -r '.data.issueUpdate.issue.state.name'
+}
+
 # APP-223 -> app-223  (lowercase, safe for paths and branch matching)
 gl_slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
@@ -144,6 +196,35 @@ gl_agent_name() {
 gl_is_free() {
   [ -f "$GL_AGENTS" ] || return 1
   [ "$(jq -r --arg id "$1" 'any(.[]; .id==$id)' "$GL_AGENTS" 2>/dev/null)" = "true" ]
+}
+
+# The CLI a session for id runs: a free agent's recorded .cli, else GL_AGENT_CLI.
+gl_agent_cli() {
+  local cli=""
+  [ -f "$GL_AGENTS" ] && cli="$(jq -r --arg id "$1" '(map(select(.id==$id))|.[0].cli) // ""' "$GL_AGENTS" 2>/dev/null || true)"
+  case "${cli:-$GL_AGENT_CLI}" in codex) printf 'codex' ;; *) printf 'claude' ;; esac
+}
+
+gl_agent_bin() {
+  case "$1" in
+    codex) printf '%s' "${GL_CODEX:-$(command -v codex || printf '%s' "$HOME/.local/bin/codex")}" ;;
+    *)     printf '%s' "${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}" ;;
+  esac
+}
+
+# Shell command for a tmux window: run id's agent session (seeded with prompt $2
+# if given), then drop to a login shell. Codex has no session-name flag, and its
+# turn-complete hook is `notify` (argv JSON, not stdin) — set per launch so
+# ~/.codex/config.toml is left alone.
+gl_agent_launch() {
+  local id="$1" prompt="${2:-}" cli args
+  cli="$(gl_agent_cli "$id")"
+  case "$cli" in
+    codex) args="--dangerously-bypass-approvals-and-sandbox -c $(printf '%q' "notify=[\"$GL_BIN/gl-notify\"]")" ;;
+    *)     args="--dangerously-skip-permissions -n $(printf '%q' "$id")" ;;
+  esac
+  [ -n "$prompt" ] && args="$args $(printf '%q' "$prompt")"
+  printf 'GL_TICKET=%q %q %s; exec %q -l' "$id" "$(gl_agent_bin "$cli")" "$args" "${SHELL:-/bin/zsh}"
 }
 
 # True when id is a real ticket in the cache (has a branch/worktree).
@@ -294,7 +375,7 @@ gl_cockpit_claude_pane() {
 # (e.g. @5). Creates the worktree + window if missing, like the original gl-open.
 gl_ensure_window() {
   local id="$1"
-  local existing branch current_branch wt brief claude_bin shell title prompt launch win
+  local existing branch current_branch wt brief title prompt launch win
   existing="$(gl_window_for "$id")"
   if [ -n "$existing" ]; then
     "$TMUX_BIN" display-message -p -t "$GL_SESSION:$existing" '#{window_id}'
@@ -305,11 +386,9 @@ gl_ensure_window() {
   # GL_AGENT_DIR — no worktree, no ticket prompt. Guarding on gl_is_ticket means
   # a stray/de-registered agent-N id can never spawn a bogus worktree.
   if gl_is_free "$id" || ! gl_is_ticket "$id"; then
-    claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
-    shell="${SHELL:-/bin/zsh}"
     title="$(gl_title "$id")"
     wt="$GL_AGENT_DIR"; [ -d "$wt" ] || wt="$HOME"
-    launch="GL_TICKET=$(printf '%q' "$id") $(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id"); exec $(printf '%q' "$shell") -l"
+    launch="$(gl_agent_launch "$id")"
     win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "$title" -c "$wt" -P -F '#{window_id}' "$launch")"
     "$TMUX_BIN" set-window-option -t "$win" @ticket "$id" >/dev/null
     "$TMUX_BIN" set-window-option -t "$win" automatic-rename off >/dev/null
@@ -345,8 +424,6 @@ gl_ensure_window() {
   brief="$("$GL_BIN/gl-brief" "$id" 2>/dev/null || true)"
   [ -z "$brief" ] && brief="$(gl_brief_path "$id")"
 
-  claude_bin="${GL_CLAUDE:-$(command -v claude || printf '%s' "$HOME/.local/bin/claude")}"
-  shell="${SHELL:-/bin/zsh}"
   title="$(gl_title "$id")"
 
   prompt="You are working on Linear ticket ${id}.
@@ -355,7 +432,7 @@ gl_ensure_window() {
 3. A quick local orientation brief is cached at ${brief} if you want a fast overview before the MCP calls.
 Then give me a concise summary of the task and its current state (Linear status + PR/CI/review status) and propose a short plan BEFORE changing any code. If node_modules is missing in this worktree, run pnpm install first."
 
-  launch="GL_TICKET=$(printf '%q' "$id") $(printf '%q ' "$claude_bin") --dangerously-skip-permissions -n $(printf '%q' "$id") $(printf '%q' "$prompt"); exec $(printf '%q' "$shell") -l"
+  launch="$(gl_agent_launch "$id" "$prompt")"
 
   win="$("$TMUX_BIN" new-window -t "$GL_SESSION" -n "$title" -c "$wt" -P -F '#{window_id}' "$launch")"
   "$TMUX_BIN" set-window-option -t "$win" @ticket "$id" >/dev/null
@@ -513,6 +590,7 @@ _gl_protected_pid() {
   cmd="$(ps -o command= -p "$p" 2>/dev/null || true)"
   case "$cmd" in
     *"daemon run"*|*"bg-pty-host"*|*"bg-spare"*) return 0;;  # shared Claude Code infra
+    *"codex app-server"*|*"codex remote-control"*) return 0;; # shared Codex daemon
     *"/tmux"*|"tmux "*|*" tmux") return 0;;
   esac
   return 1

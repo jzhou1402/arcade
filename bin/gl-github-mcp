@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# GitHub MCP server for codex sessions, authenticated from `gh` at launch so no
+# token is written into ~/.codex/config.toml. Registered by `gl-setup --codex`.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+GITHUB_PERSONAL_ACCESS_TOKEN="${GITHUB_PERSONAL_ACCESS_TOKEN:-$(gh auth token)}"
+export GITHUB_PERSONAL_ACCESS_TOKEN
+exec github-mcp-server stdio

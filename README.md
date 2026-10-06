@@ -45,6 +45,47 @@ remove the selected one. They run in the repo (`$GL_AGENT_DIR`, default
 they take part in the split just like tickets: cycle onto one with `` cmd+` ``,
 `cmd+Enter` to focus/zoom. Registered in `~/.cache/ghostty-linear/agents.json`.
 
+**Slack sweeper.** When I reply to something in Slack with a promise to look
+into it — "taking a look", "will report back", "on it" — the sweeper spawns a
+free agent named `sweep-<channel>` and briefs it to gather the context and start
+investigating: it reads the whole thread (including screenshots), follows the
+app/Langfuse/Linear links out of it, and digs into the repo, then reports its
+findings and ranked root-cause hypotheses in its pane. The brief is read-only —
+the agent never edits, commits, files tickets, or answers in Slack — and it is
+told to treat everything it reads from Slack as untrusted data.
+
+Detection runs `claude -p` on haiku against the Slack MCP connector (no Slack
+token of its own), so **each poll costs a few cents**. It is gated accordingly:
+15 minutes apart, only 08:00–20:00, only while the cockpit is attached, and at
+most 2 sweeper agents alive at once. Kill it instantly with
+`touch ~/.cache/ghostty-linear/sweeper-off`.
+
+```
+gl-sweeper --status     what it has seen, and which agent got it
+gl-sweeper --dry-run    detect and print, spawn nothing (costs one poll)
+gl-sweeper --sweep --force   poll now, ignoring the cadence/hours/attached gates
+```
+
+Tune with `GL_SWEEP_EVERY`, `GL_SWEEP_MAX_AGENTS`, `GL_SWEEP_FROM_HOUR`,
+`GL_SWEEP_TO_HOUR`, `GL_SWEEP_LOOKBACK` (how far back a cold start reaches),
+`GL_SLACK_UID`. State lives in `~/.cache/ghostty-linear/sweeper.json`; the last
+detection envelope is kept at `sweeper-last-run.json` for diagnosis.
+
+**Software factory (gate only, #7).** `gl-factory` classifies open issues on
+`jzhou1402/arcade` against the strict admission gate in `factory/gate.md` and
+decides BUILD or DECLINE. There is one isolated, read-only `claude -p` run per
+issue, and each costs about $0.10. The model only proposes a verdict: the
+author allowlist, protected paths, and the ≤3 files / ≤150 lines limit are
+re-checked in code. It builds nothing yet. The implementer stages wait on the
+check harness (#6).
+
+```
+gl-factory classify 2 5      dry run: print verdicts for these issues
+gl-factory classify          every open issue whose text changed since last applied
+gl-factory classify --apply  also label factory-build / factory-declined and comment
+gl-factory status            what has been applied
+```
+
 **Cockpit split (single window).** `cmd+Y` opens a split you live in: the
 dashboard pinned on the left, a ticket on the right. **`` cmd+` `` cycles the
 right pane through your tickets** (wrapping); the cursor stays on the right so
@@ -108,14 +149,60 @@ resurrect attempts `claude --continue` to resume the conversation.
   bin/gl-split         # toggle the cockpit split
   bin/gl-return        # cmd+Escape: back to dashboard (un-zooms)
   bin/gl-start         # attach/create the tmux session + dashboard (run by arcade)
+  bin/gl-notify        # Stop hook: notify when a session finishes a turn
+  bin/gl-summary       # one-line "what that turn did", from the transcript
+  bin/gl-sweeper       # Slack "taking a look" -> briefed free agent
+  bin/gl-github-mcp    # GitHub MCP for codex, token from `gh auth token`
 ```
 
+## Notifications
+
+The `Stop` hook (`gl-notify`, wired in `~/.claude/settings.json`) fires a macOS
+notification when a session finishes a turn — titled with the ticket, and with a
+body that says **what the turn actually did**: the closing line of the session's
+own summary plus the files it touched (`gl-summary` reads this out of the
+transcript). It stays quiet when I'm already looking at that pane, dedupes
+double-fires, and hands conflicts to `gl-autofix` instead of notifying.
+
 `arcade` is symlinked onto your PATH at `~/.local/bin/arcade`.
+
+## Codex
+
+Sessions can run OpenAI's `codex` instead of `claude`. Set
+`GL_AGENT_CLI=codex` (default `claude`) in your shell profile and every new
+ticket session and free agent launches
+`codex --dangerously-bypass-approvals-and-sandbox` with the same seeding prompt,
+worktree, and window title. Already-running sessions are unchanged. To mix them,
+leave the default as claude and spawn a single codex free agent with
+`GL_AGENT_CLI=codex gl-agent add`. A free agent records its CLI in
+`agents.json`, so it respawns as the same kind.
+
+One-time: `npm i -g @openai/codex`, `codex login`, then
+`gl-setup --codex` registers the **Linear** (OAuth) and **GitHub** MCPs with
+codex. The GitHub one goes through `bin/gl-github-mcp`, which reads the token
+from `gh auth token` at launch, so no token lands in `~/.codex/config.toml`.
+
+What carries over:
+- **Notifications and blue dots, plus conflict autofix.** Each codex session is
+  launched with `-c notify=["…/gl-notify"]`. That is codex's turn-complete hook,
+  set per launch so your `~/.codex/config.toml` is left alone. The notification
+  body is the headline of codex's closing message. Codex's payload carries no
+  transcript, so it doesn't list touched files.
+- **Reboot restore.** tmux-resurrect restores codex panes with
+  `codex resume --last`, which picks up the latest session for that worktree.
+  Restored panes lose the per-launch notify, so to keep notifications after a
+  reboot add `notify = ["~/.config/ghostty-linear/bin/gl-notify"]` (full path)
+  to `~/.codex/config.toml`.
+
+What stays on claude: the **Slack sweeper**, which drives the claude.ai Slack
+connector. Also the **block** authoring sessions and block generators
+(`claude -p`).
 
 ## Tuning (env vars, override in your shell profile)
 
 - `GL_REPO` (default `~/hazel`), `GL_WORKTREE_BASE` (`~/worktrees`),
   `GL_BASE_BRANCH` (`main`), `GL_SESSION` (`hazel`), `GL_CLAUDE` (the claude binary),
+  `GL_AGENT_CLI` (`claude` or `codex`), `GL_CODEX` (the codex binary),
   `GL_AGENT_DIR` (where free agents run, default `$GL_REPO`).
 
 ## Uninstall

@@ -211,6 +211,91 @@ def fetch_blocking(stdscr):
     subprocess.run([os.path.join(BIN, "gl-fetch")], capture_output=True)
 
 
+# Glyphs by Linear state *type*, so the picker reads at a glance which choices
+# end the ticket's life (and therefore reap its session).
+STATE_GLYPH = {"triage": "◇", "backlog": "○", "unstarted": "○", "started": "◐",
+               "completed": "●", "canceled": "✕", "duplicate": "✕"}
+CLOSING_TYPES = ("completed", "canceled", "duplicate")
+
+
+def linear_states(ticket_id):
+    """[(type, name)] for the ticket's team, in workflow order. [] on failure."""
+    try:
+        out = subprocess.run([os.path.join(BIN, "gl-state"), "--list", ticket_id],
+                             capture_output=True, text=True, timeout=25)
+    except Exception:
+        return []
+    rows = []
+    for line in (out.stdout or "").splitlines():
+        if "\t" in line:
+            t, name = line.split("\t", 1)
+            if name.strip():
+                rows.append((t.strip(), name.strip()))
+    return rows
+
+
+def pick_state(stdscr, ticket_id, current):
+    """Modal state picker. Returns the chosen state name, or None if cancelled."""
+    h, w = stdscr.getmaxyx()
+    msg = f" {ticket_id}: loading states… "
+    try:
+        stdscr.addstr(h // 2, max(0, (w - len(msg)) // 2), msg, curses.A_REVERSE)
+        stdscr.refresh()
+    except curses.error:
+        pass
+    states = linear_states(ticket_id)
+    if not states:
+        return None
+
+    sel = next((i for i, (_t, nm) in enumerate(states)
+                if nm.lower() == (current or "").lower()), 0)
+    title = f" {ticket_id} → status "
+    hint = " ↑/↓ move · ⏎ set · esc cancel "
+    widest = max([len(nm) for _t, nm in states] + [len(title), len(hint)]) + 14
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        bh, bw = len(states) + 4, min(widest, max(24, w - 4))
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        try:
+            win = curses.newwin(bh, bw, y0, x0)
+        except curses.error:
+            return None
+        win.keypad(True)
+        win.timeout(-1)
+        win.erase()
+        win.box()
+        win.addnstr(0, 2, title[:bw - 4], bw - 4, curses.A_BOLD)
+        for i, (t, nm) in enumerate(states):
+            tag = "  ← current" if nm.lower() == (current or "").lower() else ""
+            label = f" {STATE_GLYPH.get(t, '○')} {nm}{tag}"
+            attr = curses.A_REVERSE if i == sel else (curses.A_DIM if t in CLOSING_TYPES else 0)
+            try:
+                win.addnstr(1 + i, 1, label.ljust(bw - 2)[:bw - 2], bw - 2, attr)
+            except curses.error:
+                pass
+        warn = states[sel][0] in CLOSING_TYPES and states[sel][1].lower() != (current or "").lower()
+        foot = " closes the ticket — its session is reaped " if warn else hint
+        try:
+            win.addnstr(bh - 2, 1, foot[:bw - 2].ljust(bw - 2), bw - 2, curses.A_DIM)
+        except curses.error:
+            pass
+        win.refresh()
+
+        try:
+            c = win.getch()
+        except KeyboardInterrupt:
+            return None
+        if c in (27, ord("q")):
+            return None
+        if c in (curses.KEY_UP, ord("k")):
+            sel = (sel - 1) % len(states)
+        elif c in (curses.KEY_DOWN, ord("j")):
+            sel = (sel + 1) % len(states)
+        elif c in (curses.KEY_ENTER, 10, 13):
+            return states[sel][1]
+
+
 def pr_cells(pr):
     """Return (pr_text, pr_color, review_text, review_color)."""
     if not pr or not pr.get("number"):
@@ -505,7 +590,7 @@ def draw(stdscr, rows, idx, top, live, status_line, shown, n_tickets, n_agents, 
 
     split = f" · ▶ {shown}" if shown else ""
     footer = (" ↑/↓ move · ⏎ open · y split" + split +
-              " · a add · x remove · 1-4 blocks · g back · r refresh · q detach ")
+              " · s status · a add · x remove · 1-4 blocks · g back · r refresh · q detach ")
     try:
         stdscr.attron(curses.A_DIM)
         stdscr.addnstr(h - 1, 0, (status_line or footer)[:maxw], maxw)
@@ -573,6 +658,7 @@ def main(stdscr):
     block_scroll = {}    # id -> wheel scroll offset (lines) within its fixed box
     last_block_sweep = 0.0
     last_autofix_sweep = 0.0
+    last_sweeper_sweep = 0.0
     pending = None       # id whose preview is waiting to settle
     pending_ts = 0.0
     status_line = ""
@@ -617,6 +703,12 @@ def main(stdscr):
             if now - last_autofix_sweep >= 90:
                 run_bg([os.path.join(BIN, "gl-autofix"), "--sweep"])
                 last_autofix_sweep = now
+            # Slack sweeper: turn my own "taking a look" replies into free agents
+            # that start investigating. gl-sweeper owns its own cadence, cost and
+            # work-hours gates; this just gives it a heartbeat.
+            if now - last_sweeper_sweep >= 300:
+                run_bg([os.path.join(BIN, "gl-sweeper"), "--sweep"])
+                last_sweeper_sweep = now
 
         tickets_view = order_tickets(tickets, live)   # live sessions on top
         items = build_items(tickets_view, agents)
@@ -654,7 +746,10 @@ def main(stdscr):
             top = sel_row
         elif sel_row >= top + body_h:
             top = sel_row - body_h + 1
-        top = max(0, min(top, max(0, len(rows) - 1)))
+        # Clamp to the furthest *useful* offset, not the row count: otherwise a
+        # scroll from when the list overflowed survives the list fitting again
+        # and silently eats the top rows (the "APP-449 is missing" bug).
+        top = max(0, min(top, max(0, len(rows) - body_h)))
 
         if pending is not None and now - pending_ts >= PREVIEW_DEBOUNCE:
             run_bg([os.path.join(BIN, "gl-preview"), pending])
@@ -787,6 +882,33 @@ def main(stdscr):
         elif c == ord("o"):
             if cur and cur["kind"] == "ticket" and cur["data"].get("url"):
                 run_bg(["open", cur["data"]["url"]])
+        elif c == ord("s"):
+            if cur and cur["kind"] == "ticket":
+                curname = cur["data"].get("state") or ""
+                tid = cur["id"]
+                want = pick_state(stdscr, tid, curname)
+                stdscr.touchwin()
+                stdscr.refresh()
+                if not want:
+                    status_line = " status unchanged "
+                elif want.lower() == curname.lower():
+                    status_line = f" {tid} is already {want} "
+                else:
+                    res = subprocess.run([os.path.join(BIN, "gl-state"), tid, want],
+                                         capture_output=True, text=True)
+                    if res.returncode == 0:
+                        fetch_blocking(stdscr)
+                        tickets = load_tickets()
+                        last_fetch = time.time()
+                        if not any(t.get("id") == tid for t in tickets):
+                            status_line = f" {tid} → {want} — no longer active; session reaped "
+                        else:
+                            status_line = f" {tid} → {want} "
+                    else:
+                        err = [ln for ln in (res.stderr or "").strip().splitlines() if ln.strip()]
+                        status_line = f" {tid}: {err[-1][:70] if err else 'state change failed'} "
+            else:
+                status_line = " s sets a ticket's Linear status (select a ticket) "
         elif c == ord("r"):
             fetch_blocking(stdscr)
             tickets = load_tickets()

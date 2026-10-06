@@ -1,10 +1,25 @@
 #!/usr/bin/env bash
 # One-time setup: store your Linear personal API key in the macOS Keychain.
 # Get a key at https://linear.app/settings/api  (Personal API keys -> create).
+#   gl-setup --codex   register the Linear + GitHub MCPs with codex instead
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gl-lib.sh
 . "$DIR/gl-lib.sh"
+
+# `gl-setup --codex`: give codex the same Linear + GitHub MCPs claude has, so
+# GL_AGENT_CLI=codex sessions can follow the ticket-seeding prompt.
+if [ "${1:-}" = "--codex" ]; then
+  codex_bin="$(gl_agent_bin codex)"
+  [ -x "$codex_bin" ] || { echo "codex not found (npm i -g @openai/codex, or set GL_CODEX)." >&2; exit 1; }
+  have="$("$codex_bin" mcp list 2>/dev/null || true)"
+  printf '%s\n' "$have" | grep -qw linear || "$codex_bin" mcp add linear --url https://mcp.linear.app/mcp
+  printf '%s\n' "$have" | grep -qw github || "$codex_bin" mcp add github -- "$DIR/gl-github-mcp"
+  echo "Authorizing Linear for codex (opens a browser)..."
+  "$codex_bin" mcp login linear
+  echo "Done. Start codex sessions with GL_AGENT_CLI=codex (see README)."
+  exit 0
+fi
 
 echo "Paste your Linear personal API key (from https://linear.app/settings/api)."
 echo "Input is hidden; it will be stored in the macOS Keychain (service: $GL_KEYCHAIN_SERVICE)."

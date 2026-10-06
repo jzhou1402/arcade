@@ -30,7 +30,7 @@ if [ "${1:-}" = "--sweep" ]; then
         p="$("$TMUX_BIN" list-panes -t "$GL_SESSION:$_win" -F '#{pane_id}' 2>/dev/null | head -1)"
         [ -n "$p" ] || continue
         # Never paste into a session mid-turn.
-        "$TMUX_BIN" capture-pane -t "$p" -p 2>/dev/null | grep -q "esc to interrupt" && continue
+        "$TMUX_BIN" capture-pane -t "$p" -p 2>/dev/null | grep -qi "esc to interrupt" && continue
         "$0" "$tid" >/dev/null 2>&1 || true
       done
   exit 0

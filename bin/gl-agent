@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Manage ad-hoc "free agent" claude windows (not tied to a Linear ticket).
 #   gl-agent add [name]     register a new agent-N, spawn its claude window
+#                           (GL_AGENT_CLI=codex gl-agent add → a codex one)
 #   gl-agent remove [id]     kill its window + drop it from the registry
 #   gl-agent list            print agent ids (one per line)
 # Free agents live in $GL_AGENT_DIR (the repo by default) and carry
@@ -29,17 +30,23 @@ case "$cmd" in
     done < <(gl_agent_ids)
     id="agent-$((max + 1))"
     [ -n "$name" ] || name="$id"
-    jq --arg id "$id" --arg name "$name" '. + [{id:$id, name:$name}]' "$GL_AGENTS" | _write_registry
+    jq --arg id "$id" --arg name "$name" --arg cli "$GL_AGENT_CLI" \
+      '. + [{id:$id, name:$name, cli:$cli}]' "$GL_AGENTS" | _write_registry
 
     [ -n "$TMUX_BIN" ] || { printf '%s\n' "$id"; exit 0; }
     win="$(gl_ensure_window "$id")"
-    printf '%s\n' "$id" > "$GL_SELECTED"
-    gl_lock 15 || true                 # serialize the cockpit change with peers
-    if gl_split_active; then
-      gl_show_ticket "$id"
-      gl_focus_right "$(gl_cockpit_window)"
-    else
-      "$TMUX_BIN" select-window -t "$win" >/dev/null 2>&1 || true
+    # GL_AGENT_QUIET=1: spawn without taking over the display. Background callers
+    # (gl-sweeper) create agents while I'm working in another pane, and pulling
+    # the cockpit onto a new window mid-sentence is worse than not seeing it.
+    if [ "${GL_AGENT_QUIET:-0}" != "1" ]; then
+      printf '%s\n' "$id" > "$GL_SELECTED"
+      gl_lock 15 || true               # serialize the cockpit change with peers
+      if gl_split_active; then
+        gl_show_ticket "$id"
+        gl_focus_right "$(gl_cockpit_window)"
+      else
+        "$TMUX_BIN" select-window -t "$win" >/dev/null 2>&1 || true
+      fi
     fi
     printf '%s\n' "$id"
     ;;

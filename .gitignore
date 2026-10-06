@@ -14,3 +14,7 @@ __pycache__/
 blocks/*/output.json
 blocks/*/history
 blocks/*/.lock.d/
+
+# Slack token for the mentions block (never commit)
+.slack_token
+blocks/*/.slack_token

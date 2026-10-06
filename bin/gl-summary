@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""One-line summary of what a claude session just did, for the Stop-hook
+notification. Reads the session transcript, isolates the turn that just ended
+(everything after the last real user message), and reports the closing summary
+plus the files it touched -- so the notification says what changed instead of
+"Claude finished".
+
+    gl-summary <transcript.jsonl>   -> one line on stdout (empty if unknowable)
+    gl-summary --text < message     -> the same headline from a bare closing
+                                       message (Codex's notify payload has no
+                                       transcript, so no touched files)
+"""
+
+import json
+import os
+import re
+import sys
+
+MAX = 96          # notification bodies get truncated by macOS well before this
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+
+def rows(path):
+    out = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+    return out
+
+
+def blocks(row):
+    content = (row.get("message") or {}).get("content")
+    return content if isinstance(content, list) else []
+
+
+def is_real_user(row):
+    """A message I typed -- not a tool result being fed back to the model."""
+    if row.get("type") != "user":
+        return False
+    content = (row.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(b.get("type") == "text" for b in content if isinstance(b, dict))
+    return False
+
+
+def turn(all_rows):
+    starts = [i for i, r in enumerate(all_rows) if is_real_user(r)]
+    return all_rows[starts[-1]:] if starts else all_rows
+
+
+def closing_text(turn_rows):
+    texts = [
+        b.get("text", "").strip()
+        for r in turn_rows if r.get("type") == "assistant"
+        for b in blocks(r)
+        if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()
+    ]
+    return texts[-1] if texts else ""
+
+
+def touched(turn_rows):
+    """Files edited this turn, in first-touch order."""
+    seen = []
+    for r in turn_rows:
+        if r.get("type") != "assistant":
+            continue
+        for b in blocks(r):
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            if b.get("name") not in EDIT_TOOLS:
+                continue
+            path = (b.get("input") or {}).get("file_path") or ""
+            name = os.path.basename(path)
+            if name and name not in seen:
+                seen.append(name)
+    return seen
+
+
+def headline(text):
+    """First real sentence of the closing message, stripped of markdown.
+
+    Fenced code is dropped first (its language tag reads as a one-word summary),
+    and a line ending in ":" is only used as a last resort -- it introduces the
+    block that follows rather than saying anything itself.
+    """
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"```.*", " ", text, flags=re.S)               # unclosed fence
+    fallback = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[#>\-\*\d\.\)\s]+", "", line)          # heading/bullet/list marker
+        line = re.sub(r"[`*_]", "", line)                        # inline emphasis
+        line = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", line)    # links -> label
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        cut = re.split(r"(?<=[.!?])\s+", line)[0]
+        cut = cut if len(cut) >= 12 else line
+        if cut.endswith(":"):
+            fallback = fallback or cut
+            continue
+        return cut
+    return fallback
+
+
+def clip(s, limit):
+    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
+
+
+def main():
+    if sys.argv[1:2] == ["--text"]:
+        head = clip(headline(sys.stdin.read()), MAX)
+        if head:
+            print(head)
+        return
+    if len(sys.argv) < 2 or not os.path.exists(sys.argv[1]):
+        return
+    turn_rows = turn(rows(sys.argv[1]))
+    files = touched(turn_rows)
+    if files:
+        tail = " · " + (", ".join(files[:2]) if len(files) <= 2 else f"{len(files)} files")
+    else:
+        tail = ""
+    head = clip(headline(closing_text(turn_rows)), MAX - len(tail))
+    if not head:
+        head = "edited " + ", ".join(files[:2]) if files else ""
+        tail = ""
+    line = (head + tail).strip()
+    if line:
+        print(line)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass          # a notification is never worth failing a hook over

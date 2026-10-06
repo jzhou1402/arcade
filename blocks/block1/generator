@@ -118,7 +118,12 @@ def read_token():
     for path in (os.path.join(CONFIG_DIR, ".slack_token"), ".slack_token"):
         try:
             with open(path) as f:
-                tok = f.read().strip()
+                raw = f.read()
+            # Bare token, or a `SLACK_USER_TOKEN=xoxp-...` line.
+            m = re.search(r"^\s*SLACK_USER_TOKEN\s*=\s*['\"]?([^'\"\s]+)", raw, re.M)
+            tok = m.group(1) if m else raw.strip()
+            if "=" in tok:
+                tok = ""
             if tok:
                 return tok, None
         except OSError:

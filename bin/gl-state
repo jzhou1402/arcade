@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Change a Linear ticket's workflow state.
+#   gl-state --list <ID>        the team's states, as "type<TAB>name"
+#   gl-state <ID> "<State>"     move the ticket to that state (exact name)
+# The explicit, user-driven counterpart to gl-close: gl-close is automatic and
+# honours $GL_CACHE/close-off, this never is — asking for a state change is the
+# consent. Callers refresh the cache themselves (gl-fetch is slow and reaps).
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=gl-lib.sh
+. "$DIR/gl-lib.sh"
+
+case "${1:-}" in
+  --list)
+    [ -n "${2:-}" ] || { gl_log "usage: gl-state --list <ID>"; exit 1; }
+    gl_issue_states "$2"
+    ;;
+  ""|-h|--help)
+    gl_log "usage: gl-state {--list <ID>|<ID> <State>}"; exit 1
+    ;;
+  *)
+    [ -n "${2:-}" ] || { gl_log "usage: gl-state <ID> <State>"; exit 1; }
+    new="$(gl_set_state "$1" "$2")" || exit 1
+    gl_log "gl-state: $1 -> $new"
+    ;;
+esac

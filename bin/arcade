@@ -12,8 +12,9 @@ GL_CONFIG_DIR="${GL_CONFIG_DIR:-$HOME/.config/ghostty-linear}"
 c_dim=$'\033[2m'; c_b=$'\033[1m'; c_cy=$'\033[36m'; c_gr=$'\033[32m'; c_r=$'\033[0m'
 
 tmux_v="$("$TMUX_BIN" -V 2>/dev/null || echo 'tmux ?')"
-claude_v="$({ "${GL_CLAUDE:-claude}" --version 2>/dev/null || true; } | head -1)"
-[ -n "$claude_v" ] || claude_v="not found"
+agent_cli="$(gl_agent_cli "")"
+agent_v="$({ "$(gl_agent_bin "$agent_cli")" --version 2>/dev/null || true; } | head -1)"
+[ -n "$agent_v" ] || agent_v="not found"
 
 if gl_session_exists; then
   action="reattaching to live session"
@@ -32,7 +33,7 @@ fi
 printf '\n'
 printf '%s  🕹  arcade %s%s%s  %s·  ghostty · tmux · linear cockpit%s\n' "$c_cy" "$c_b" "v$GL_VERSION" "$c_r" "$c_cy" "$c_r"
 printf '%s  ├─ build    %s%s “%s”%s\n' "$c_dim" "$c_r" "$c_dim" "$GL_CODENAME" "$c_r"
-printf '%s  ├─ %s · claude %s%s\n' "$c_dim" "$tmux_v" "$claude_v" "$c_r"
+printf '%s  ├─ %s · %s %s%s\n' "$c_dim" "$tmux_v" "$agent_cli" "$agent_v" "$c_r"
 printf '%s  ├─ session  %s%s%s%s   repo %s%s%s\n' "$c_dim" "$c_r" "$c_gr" "$GL_SESSION" "$c_dim" "$c_r" "${GL_REPO/#$HOME/~}" "$c_r"
 printf '%s  ├─ tickets  %s%s%s\n' "$c_dim" "$c_r" "$tickets_line" "$c_r"
 printf '%s  └─ %s%s%s\n' "$c_dim" "$c_b" "${action}…" "$c_r"

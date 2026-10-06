@@ -60,8 +60,8 @@ base="$(printf '%s' "$resp" | jq '
       stateType: .state.type,
       priority: (.priority // 0),
       updatedAt: .updatedAt,
-      prUrl: ([ .attachments.nodes[].url
-                | select(test("github\\.com/.+/pull/[0-9]+")) ] | first // null),
+      prUrls: [ .attachments.nodes[].url
+                | select(test("github\\.com/.+/pull/[0-9]+")) ],
       pr: null
     } ]
   | map(select((.state // "" | ascii_downcase)
@@ -78,17 +78,34 @@ printf '%s' "$base" > "$tmp"
 if command -v gh >/dev/null 2>&1; then
   count="$(jq 'length' "$tmp")"
   for i in $(seq 0 $((count - 1))); do
-    prurl="$(jq -r ".[$i].prUrl // empty" "$tmp")"
     branch="$(jq -r ".[$i].branch // empty" "$tmp")"
 
-    raw=""
-    if [ -n "$prurl" ]; then
-      raw="$(gh pr view "$prurl" \
+    raw=""; rank=9
+    # A ticket can carry several PR attachments (a superseded PR, a follow-up).
+    # Prefer an OPEN one: closing any single attached PR must not read as "this
+    # ticket's PR closed", because auto-close acts on that and cancels the
+    # ticket. That is what cancelled ENG-1042 while its real PR was still open.
+    while IFS= read -r prurl; do
+      [ -n "$prurl" ] || continue
+      one="$(gh pr view "$prurl" \
         --json number,state,isDraft,reviewDecision,mergeable,additions,deletions,changedFiles,statusCheckRollup \
         2>/dev/null || true)"
-    elif [ -n "$branch" ] && [ -d "$GL_REPO/.git" ]; then
+      [ -n "$one" ] || continue
+      # Rank by state, don't just take the first: OPEN > MERGED > CLOSED. A
+      # ticket carrying both a merged PR and an abandoned one is Done, not
+      # cancelled, and attachment order says nothing about which is which.
+      case "$(printf '%s' "$one" | jq -r '.state')" in
+        OPEN)   r=0 ;;
+        MERGED) r=1 ;;
+        *)      r=2 ;;
+      esac
+      if [ "$r" -lt "$rank" ]; then rank="$r"; raw="$one"; fi
+      [ "$r" = 0 ] && break
+    done < <(jq -r ".[$i].prUrls[]? // empty" "$tmp")
+
+    if [ -z "$raw" ] && [ -n "$branch" ] && [ -d "$GL_REPO/.git" ]; then
       raw="$(gh pr list --repo "$(gh repo view "$GL_REPO" --json nameWithOwner -q .nameWithOwner 2>/dev/null)" \
-        --head "$branch" --state all --limit 1 \
+        --head "$branch" --state open --limit 1 \
         --json number,state,isDraft,reviewDecision,mergeable,additions,deletions,changedFiles,statusCheckRollup \
         2>/dev/null | jq '.[0] // empty' || true)"
     fi

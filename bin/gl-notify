@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
-# Claude Code "Stop" hook handler for arcade sessions: when a ticket/agent
+# Claude Code "Stop" hook (and Codex `notify`) handler for arcade sessions: when a ticket/agent
 # session finishes a turn, fire a macOS notification and mark it "unread" (a
 # marker the dashboard turns into a blue dot). No-op for non-arcade claude
 # sessions and when the user is already looking at that session's pane.
 #
 # Which session fired is taken from $GL_TICKET (exported at launch); if absent,
-# from the hook's JSON stdin `cwd` when it's a ticket worktree.
+# from the payload's `cwd` when it's a ticket worktree.
+#
+# Claude sends its hook JSON on stdin. Codex passes an `agent-turn-complete`
+# JSON as the last argv (and stdin may be a tty, so it must not be read); it is
+# normalized to the Claude field names used below.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gl-lib.sh
 . "$DIR/gl-lib.sh"
 
-payload="$(cat 2>/dev/null || true)"      # hook JSON on stdin
+agent="Claude"
+if [ "$#" -gt 0 ]; then
+  [ "$(printf '%s' "${!#}" | jq -r '.type // empty' 2>/dev/null || true)" = "agent-turn-complete" ] || exit 0
+  agent="Codex"
+  payload="$(printf '%s' "${!#}" | jq -c '{cwd, session_id: .["thread-id"], last_assistant_message: .["last-assistant-message"]}' 2>/dev/null || true)"
+else
+  payload="$(cat 2>/dev/null || true)"
+fi
 
 id="${GL_TICKET:-}"
 if [ -z "$id" ]; then
@@ -59,10 +70,23 @@ last="$(cat "$nstamp" 2>/dev/null || echo 0)"; case "$last" in ''|*[!0-9]*) last
 [ "$((nows - last))" -lt 10 ] && exit 0
 printf '%s' "$nows" > "$nstamp"
 
-# Notify (macOS). Sanitize the title for AppleScript string literals.
+# Notify (macOS). The body says what the turn actually did -- gl-summary reads
+# the closing message and the files it touched out of the transcript -- so the
+# notification is worth reading without switching to the pane. Sanitize both
+# strings for AppleScript literals.
 ntitle="$(gl_title "$id" 2>/dev/null || printf '%s' "$id")"
 ntitle="$(printf '%s' "$ntitle" | tr -d '"\\')"
-osascript -e "display notification \"Claude finished\" with title \"${ntitle:-$id}\" sound name \"Tink\"" >/dev/null 2>&1 || true
+tpath="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
+lastmsg="$(printf '%s' "$payload" | jq -r '.last_assistant_message // empty' 2>/dev/null || true)"
+nbody=""
+if [ -n "$tpath" ] && [ -f "$tpath" ]; then
+  nbody="$("$DIR/gl-summary" "$tpath" 2>/dev/null || true)"
+elif [ -n "$lastmsg" ]; then
+  nbody="$(printf '%s' "$lastmsg" | "$DIR/gl-summary" --text 2>/dev/null || true)"
+fi
+[ -n "$nbody" ] || nbody="$agent finished"
+nbody="$(printf '%s' "$nbody" | tr -d '"\\' | tr '\n' ' ')"
+osascript -e "display notification \"$nbody\" with title \"${ntitle:-$id}\" sound name \"Tink\"" >/dev/null 2>&1 || true
 
 # Mark unread (dashboard shows a blue dot until the item is opened).
 mkdir -p "$GL_CACHE/unread" 2>/dev/null || true

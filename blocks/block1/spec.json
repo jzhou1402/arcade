@@ -4,5 +4,5 @@
   "cadence": "5m",
   "mode": "compiler",
   "instruction": "Poll Slack for new @mentions of me anywhere (channels and DMs), fire a macOS notification for each one I haven't seen yet, and show the recent ones on the card.",
-  "status": "active"
+  "status": "configuring"
 }
